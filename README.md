@@ -7,10 +7,12 @@
 - `/`：公开照片墙
 - `/admin/login`：后台登录
 - `/admin/photos`：照片上传、任务进度、显隐管理、删除照片
+- `/admin/settings`：网站标题、页面标题、favicon 设置
 - `/api/auth/*`：后台登录和 token 校验
 - `/api/photos/*`：照片 metadata、上传任务、显隐和删除
+- `/api/settings/*`：站点设置读取和保存
 
-照片文件保存在 OSS，照片列表和显隐状态保存在 `src/data/images-metadata.json`。
+照片文件保存在 OSS，照片列表和显隐状态保存在 `src/data/images-metadata.json`，站点标题和图标配置保存在 `src/data/site-settings.json`。
 
 ## 目录说明
 
@@ -161,7 +163,7 @@ docker compose down
 - 挂载 `./src/data:/app/src/data`
 - 使用 `/tmp/photowall-uploads` 作为上传临时目录
 
-`src/data` 挂载很重要。后台上传、显隐切换、删除照片都会更新 `images-metadata.json`，挂载后容器重建不会丢状态。
+`src/data` 挂载很重要。后台上传、显隐切换、删除照片都会更新 `images-metadata.json`，站点设置会更新 `site-settings.json`，挂载后容器重建不会丢状态。
 
 ## GitHub Actions 部署
 
@@ -186,8 +188,9 @@ docker-compose.prod.yml
 3. Action 通过 SSH 登录服务器。
 4. 上传 `docker-compose.prod.yml` 到服务器部署目录。
 5. 服务器执行 `docker compose pull`。
-6. 如果服务器上没有 `src/data/images-metadata.json`，就执行一次 OSS metadata 同步。
-7. 执行 `docker compose up -d` 启动服务。
+6. 如果服务器上没有 `src/data/site-settings.json`，就生成一份默认站点设置。
+7. 如果服务器上没有 `src/data/images-metadata.json`，就执行一次 OSS metadata 同步。
+8. 执行 `docker compose up -d` 启动服务。
 
 需要在 GitHub 仓库中配置 Secrets：
 
@@ -241,6 +244,22 @@ VITE_OSS_PHOTOWALL_BASE_URL=
 ```
 
 首次部署时，如果服务器上不存在：
+
+```text
+src/data/site-settings.json
+```
+
+Action 会自动生成一份默认配置：
+
+```json
+{
+  "siteTitle": "PhotoWall",
+  "galleryTitle": "Photo Wall",
+  "favicon": "/resources/fangnai.jpg"
+}
+```
+
+如果服务器上不存在：
 
 ```text
 src/data/images-metadata.json
@@ -371,6 +390,8 @@ docker compose up -d --build
 volumes:
   - ./src/data:/app/src/data
 ```
+
+这个目录同时保存 `images-metadata.json` 和 `site-settings.json`。
 
 ### Certbot 提示证书文件不存在
 

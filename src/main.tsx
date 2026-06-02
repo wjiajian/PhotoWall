@@ -8,6 +8,7 @@ import { GalleryPage } from './pages/GalleryPage';
 import { AdminLayout } from './pages/admin/AdminLayout';
 import { LoginPage } from './pages/admin/LoginPage';
 import { PhotosManagement } from './pages/admin/PhotosManagement';
+import { SiteSettingsPage } from './pages/admin/SiteSettingsPage';
 import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -26,6 +27,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
         >
           <Route index element={<Navigate replace to="/admin/photos" />} />
           <Route path="photos" element={<PhotosManagement />} />
+          <Route path="settings" element={<SiteSettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate replace to="/" />} />
       </Routes>

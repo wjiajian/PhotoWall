@@ -8,6 +8,7 @@ import helmet from 'helmet';
 
 import authRoutes from './src/routes/auth.js';
 import photosRoutes from './src/routes/photos.js';
+import settingsRoutes from './src/routes/settings.js';
 import { assertAuthConfig } from './src/config/auth.js';
 
 dotenv.config();
@@ -67,6 +68,7 @@ if (fs.existsSync(distPath)) {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/photos', photosRoutes);
+app.use('/api/settings', settingsRoutes);
 
 app.use((req: Request, res: Response) => {
   if (req.path.startsWith('/api')) {

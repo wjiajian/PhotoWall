@@ -15,6 +15,7 @@
     "src/middleware/**/*.ts",
     "src/routes/**/*.ts",
     "src/services/**/*.ts",
-    "src/utils/photoUrl.ts"
+    "src/utils/photoUrl.ts",
+    "src/utils/siteSettings.ts"
   ]
 }

@@ -14,6 +14,7 @@ import { useDebouncedCallback } from '../hooks/useDebounce';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useThemeMode } from '../hooks/useThemeMode';
 import { usePageTitle } from '../hooks/usePageTitle';
+import { useSiteSettings } from '../hooks/useSiteSettings';
 import { GallerySkeleton } from '../components/Skeleton';
 
 const PHOTO_ASSET_BASE_URL = import.meta.env.VITE_OSS_PHOTOWALL_BASE_URL as string | undefined;
@@ -58,6 +59,7 @@ export const GalleryPage: React.FC = () => {
   const [selectedMonth, setSelectedMonth] = useState(ALL_MONTHS);
   const [liveOnly, setLiveOnly] = useState(false);
   const { darkMode, toggleDarkMode } = useThemeMode();
+  const siteSettings = useSiteSettings();
   usePageTitle('照片墙');
 
   // 解析图片列表
@@ -212,7 +214,7 @@ export const GalleryPage: React.FC = () => {
 
             {/* 标题 - 移动端居中显示 */}
             <h1 className={`text-xl font-bold tracking-tight ${isMobile ? 'absolute left-1/2 -translate-x-1/2' : ''}`}>
-              Photo Wall
+              {siteSettings.galleryTitle}
             </h1>
 
             {/* 右侧控制区 */}

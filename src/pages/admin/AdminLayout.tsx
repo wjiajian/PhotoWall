@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { 
   Image, 
   Menu, 
+  Settings,
 } from 'lucide-react';
 import { useIsMobile } from '../../hooks/useIsMobile';
 import { logout, getUsername } from '../../utils/auth';
@@ -11,6 +12,7 @@ import { AdminSidebarPanel, type AdminNavItem } from '../../components/admin/Adm
 
 const navItems: AdminNavItem[] = [
   { icon: <Image size={20} />, label: '照片管理', path: '/admin/photos' },
+  { icon: <Settings size={20} />, label: '站点设置', path: '/admin/settings' },
 ];
 
 interface AdminMobileSidebarProps {

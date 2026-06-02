@@ -112,6 +112,20 @@ jobs:
 
           docker compose -f docker-compose.prod.yml pull photowall
 
+          if [ ! -s src/data/site-settings.json ]; then
+            echo "site-settings.json is missing or empty, creating default settings..."
+            cat > src/data/site-settings.json <<'JSON'
+          {
+            "siteTitle": "照片墙",
+            "galleryTitle": "人生是不断的回忆",
+            "favicon": "/resources/fangnai.jpg"
+          }
+          JSON
+            chown 1000:1000 src/data/site-settings.json 2>/dev/null || chmod a+rw src/data/site-settings.json
+          else
+            echo "site-settings.json exists, skip default settings creation."
+          fi
+
           if [ ! -s src/data/images-metadata.json ]; then
             echo "images-metadata.json is missing or empty, rebuilding it from OSS..."
             docker compose -f docker-compose.prod.yml run --rm photowall npm run rebuild-oss-metadata
