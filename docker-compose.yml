@@ -1,0 +1,25 @@
+services:
+  photowall:
+    build:
+      context: .
+      args:
+        VITE_OSS_PHOTOWALL_BASE_URL: ${VITE_OSS_PHOTOWALL_BASE_URL:-}
+        VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH: ${VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH:-3}
+        VITE_PHOTO_UPLOAD_BATCH_MB: ${VITE_PHOTO_UPLOAD_BATCH_MB:-30}
+    image: jiajian-photowall:latest
+    container_name: photowall
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      PHOTO_UPLOAD_TMP_DIR: /tmp/photowall-uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src/data:/app/src/data
+      - photowall_upload_tmp:/tmp/photowall-uploads
+    restart: unless-stopped
+
+volumes:
+  photowall_upload_tmp:

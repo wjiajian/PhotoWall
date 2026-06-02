@@ -1,2 +1,293 @@
 # PhotoWall
-个人网站的照片墙
+
+独立照片墙，用于个人网站的公开照片展示和照片管理后台。
+公开展示、年月筛选、实况照片、Lightbox、照片信息侧栏、后台登录、上传、显隐管理和删除。
+## 功能
+
+- `/`：公开照片墙
+- `/admin/login`：后台登录
+- `/admin/photos`：照片上传、任务进度、显隐管理、删除照片
+- `/api/auth/*`：后台登录和 token 校验
+- `/api/photos/*`：照片 metadata、上传任务、显隐和删除
+
+照片文件保存在 OSS，照片列表和显隐状态保存在 `src/data/images-metadata.json`。
+
+## 目录说明
+
+```text
+PhotoWall/
+├─ src/
+│  ├─ components/PhotoWall/     # 照片墙展示组件
+│  ├─ pages/admin/              # 管理后台页面
+│  ├─ routes/                   # Express API 路由
+│  ├─ services/                 # OSS 上传、图片处理、上传队列
+│  └─ data/                     # images-metadata.json 所在目录
+├─ scripts/
+│  └─ rebuild-oss-photowall-metadata.mjs
+├─ server.ts                    # Express 入口
+├─ Dockerfile
+└─ docker-compose.yml
+```
+
+## 环境变量
+
+复制示例文件：
+
+```bash
+cp .env.example .env
+```
+
+生产环境至少填写：
+
+```env
+NODE_ENV=production
+PORT=3000
+CORS_ORIGIN=https://photowall.example.domain
+
+ADMIN_USERNAME=
+ADMIN_PASSWORD=
+JWT_SECRET=
+
+OSS_REGION=
+OSS_BUCKET=
+OSS_ACCESS_KEY_ID=
+OSS_ACCESS_KEY_SECRET=
+OSS_PHOTOWALL_BASE_URL=
+VITE_OSS_PHOTOWALL_BASE_URL=
+```
+
+说明：
+
+- `ADMIN_PASSWORD` 可以先用明文，正式部署更建议使用 `ADMIN_PASSWORD_HASH`。
+- `JWT_SECRET` 请使用足够长的随机字符串。
+- `OSS_PHOTOWALL_BASE_URL` 是服务端返回图片时使用的 OSS 公开访问地址。
+- `VITE_OSS_PHOTOWALL_BASE_URL` 是前端构建时使用的 OSS 公开访问地址，通常和 `OSS_PHOTOWALL_BASE_URL` 相同。
+- 修改任何 `VITE_` 开头的变量后，需要重新构建前端或重新构建 Docker 镜像。
+
+## 本地开发
+
+安装依赖：
+
+```bash
+npm install
+```
+
+启动前端开发服务：
+
+```bash
+npm run dev
+```
+
+启动 Express 服务：
+
+```bash
+npm run start
+```
+
+构建：
+
+```bash
+npm run build
+npm run build:server
+```
+
+生产方式启动：
+
+```bash
+npm run serve
+```
+
+## 从 OSS 同步 Metadata
+
+如果 OSS 中已经存在照片，可以用脚本生成 `src/data/images-metadata.json`。
+
+需要 OSS 中的对象满足这些前缀：
+
+```text
+photowall/origin/
+photowall/thumbnails/full/
+photowall/thumbnails/medium/
+photowall/thumbnails/tiny/
+```
+
+示例：
+
+```text
+photowall/origin/IMG_001.HEIC
+photowall/thumbnails/full/IMG_001.HEIC.jpg
+photowall/thumbnails/medium/IMG_001.HEIC.jpg
+photowall/thumbnails/tiny/IMG_001.HEIC.jpg
+```
+
+本地同步：
+
+```bash
+npm install
+npm run rebuild-oss-metadata
+```
+
+脚本会读取 OSS 对象、解析 EXIF 拍摄时间、读取图片宽高，并生成：
+
+```text
+src/data/images-metadata.json
+```
+
+如果 metadata 已经存在，脚本会尽量保留旧记录中的 `isVisible` 和 `visibilityUpdatedAt`。
+
+## Docker 部署
+
+第一次构建并启动：
+
+```bash
+docker compose up -d --build
+```
+
+查看日志：
+
+```bash
+docker compose logs -f photowall
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+`docker-compose.yml` 默认：
+
+- 监听宿主机 `3000` 端口
+- 读取 `.env`
+- 挂载 `./src/data:/app/src/data`
+- 使用 `/tmp/photowall-uploads` 作为上传临时目录
+
+`src/data` 挂载很重要。后台上传、显隐切换、删除照片都会更新 `images-metadata.json`，挂载后容器重建不会丢状态。
+
+## Docker 下同步 OSS Metadata
+
+如果你使用 Docker 部署，并且 OSS 里已经有照片，推荐这样同步：
+
+```bash
+docker compose build
+docker compose run --rm photowall npm run rebuild-oss-metadata
+docker compose up -d
+```
+
+这个命令会读取 `.env` 中的 OSS 配置，并把生成的 `images-metadata.json` 写入宿主机的 `./src/data`。
+
+服务已经运行时，也可以执行：
+
+```bash
+docker compose exec photowall npm run rebuild-oss-metadata
+```
+
+同步完成后，刷新页面即可。照片 metadata 接口会动态读取文件。
+
+## Nginx 反代
+
+如果使用 `photowall.example.domain`，可以让 Nginx 反代到容器暴露的 `3000` 端口：
+
+```nginx
+upstream photowall_app {
+  server 127.0.0.1:3000;
+}
+
+server {
+  listen 80;
+  server_name photowall.example.domain;
+  return 301 https://photowall.example.domain$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name photowall.example.domain;
+
+  ssl_certificate /etc/letsencrypt/live/photowall.example.domain/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/photowall.example.domain/privkey.pem;
+
+  client_max_body_size 80m;
+
+  location / {
+    proxy_pass http://photowall_app;
+    proxy_http_version 1.1;
+    include /etc/nginx/proxy_params;
+  }
+}
+```
+
+## 常用命令
+
+```bash
+# 构建镜像并启动
+docker compose up -d --build
+
+# 只重启服务
+docker compose restart photowall
+
+# 查看日志
+docker compose logs -f photowall
+
+# 进入容器
+docker compose exec photowall sh
+
+# 从 OSS 重建 metadata
+docker compose run --rm photowall npm run rebuild-oss-metadata
+```
+
+## 常见问题
+
+### 页面没有照片
+
+检查 `src/data/images-metadata.json` 是否存在，并确认 OSS 公开访问地址是否正确：
+
+```bash
+ls -lh src/data/images-metadata.json
+```
+
+同时确认 `.env` 中的：
+
+```env
+OSS_PHOTOWALL_BASE_URL=
+VITE_OSS_PHOTOWALL_BASE_URL=
+```
+
+### 后台无法上传
+
+检查 OSS 写入配置：
+
+```env
+OSS_REGION=
+OSS_BUCKET=
+OSS_ACCESS_KEY_ID=
+OSS_ACCESS_KEY_SECRET=
+```
+
+还需要确认 OSS AccessKey 有上传、删除对象的权限。
+
+### 修改 VITE 配置后没有生效
+
+`VITE_` 开头的变量会在前端构建时写入产物。修改后需要重新构建：
+
+```bash
+docker compose up -d --build
+```
+
+### 容器重建后显隐状态丢失
+
+确认 `docker-compose.yml` 中保留了这个挂载：
+
+```yaml
+volumes:
+  - ./src/data:/app/src/data
+```
+
+### Certbot 提示证书文件不存在
+
+通常是 Nginx 配置已经引用了还没申请到的证书。先临时移除该域名的 443 配置，只保留 80 配置，确认：
+
+```bash
+nginx -t
+systemctl reload nginx
+```
+
+然后再申请证书，最后恢复 HTTPS 配置。

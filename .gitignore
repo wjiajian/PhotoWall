@@ -1,0 +1,8 @@
+dist/
+dist-server/
+node_modules/
+.env
+
+*log
+
+src/data/images-metadata.json

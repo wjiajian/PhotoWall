@@ -1,0 +1,17 @@
+[
+  {
+    "filename": "example.heic",
+    "title": "示例照片",
+    "description": "可选描述，供 Gallery/Admin 展示",
+    "alt": "示例照片 alt 文本",
+    "date": "2026-03-06",
+    "location": "Hangzhou",
+    "width": 4032,
+    "height": 3024,
+    "size": 5242880,
+    "mimeType": "image/heic",
+    "thumbnail": "/photowall/thumbnails/medium/example.heic.jpg",
+    "tiny": "/photowall/thumbnails/tiny/example.heic.jpg",
+    "url": "/photowall/origin/example.heic"
+  }
+]
