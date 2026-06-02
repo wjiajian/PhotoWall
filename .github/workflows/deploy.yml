@@ -69,24 +69,31 @@ jobs:
         run: |
           DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
           if [ -z "$DEPLOY_PATH" ]; then
-            DEPLOY_PATH="$HOME/photowall"
+            DEPLOY_PATH="~/photowall"
           fi
 
-          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '$DEPLOY_PATH/src/data'"
-          sshpass -p "${{ secrets.SSH_PASSWORD }}" scp -P "${{ secrets.SSH_PORT || '22' }}" docker-compose.prod.yml "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$DEPLOY_PATH/docker-compose.prod.yml"
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" scp -P "${{ secrets.SSH_PORT || '22' }}" docker-compose.prod.yml "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/photowall-docker-compose.prod.yml"
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "DEPLOY_PATH='$DEPLOY_PATH' bash -s" <<'EOF'
+          set -euo pipefail
+          DEPLOY_PATH="${DEPLOY_PATH/#\~/$HOME}"
+          mkdir -p "$DEPLOY_PATH/src/data"
+          mv /tmp/photowall-docker-compose.prod.yml "$DEPLOY_PATH/docker-compose.prod.yml"
+          EOF
 
       - name: Deploy on server
         shell: bash
         run: |
           DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
           if [ -z "$DEPLOY_PATH" ]; then
-            DEPLOY_PATH="$HOME/photowall"
+            DEPLOY_PATH="~/photowall"
           fi
 
           sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
             "DEPLOY_PATH='$DEPLOY_PATH' PHOTOWALL_IMAGE='${{ needs.build.outputs.image }}' GHCR_USERNAME='${{ secrets.GHCR_USERNAME }}' GHCR_TOKEN='${{ secrets.GHCR_TOKEN }}' bash -s" <<'EOF'
           set -euo pipefail
 
+          DEPLOY_PATH="${DEPLOY_PATH/#\~/$HOME}"
           cd "$DEPLOY_PATH"
           mkdir -p src/data
           chown -R 1000:1000 src/data 2>/dev/null || chmod -R a+rwX src/data
