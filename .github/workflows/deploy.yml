@@ -59,9 +59,9 @@ jobs:
       - name: Prepare SSH
         shell: bash
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+          install -m 700 -d ~/.ssh
           ssh-keyscan -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Upload compose file
@@ -72,8 +72,8 @@ jobs:
             DEPLOY_PATH="$HOME/photowall"
           fi
 
-          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '$DEPLOY_PATH/src/data'"
-          scp -i ~/.ssh/id_ed25519 -P "${{ secrets.SSH_PORT || '22' }}" docker-compose.prod.yml "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$DEPLOY_PATH/docker-compose.prod.yml"
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '$DEPLOY_PATH/src/data'"
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" scp -P "${{ secrets.SSH_PORT || '22' }}" docker-compose.prod.yml "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$DEPLOY_PATH/docker-compose.prod.yml"
 
       - name: Deploy on server
         shell: bash
@@ -83,7 +83,7 @@ jobs:
             DEPLOY_PATH="$HOME/photowall"
           fi
 
-          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
             "DEPLOY_PATH='$DEPLOY_PATH' PHOTOWALL_IMAGE='${{ needs.build.outputs.image }}' GHCR_USERNAME='${{ secrets.GHCR_USERNAME }}' GHCR_TOKEN='${{ secrets.GHCR_TOKEN }}' bash -s" <<'EOF'
           set -euo pipefail
 

@@ -194,7 +194,7 @@ docker-compose.prod.yml
 ```text
 SSH_HOST           服务器 IP 或域名
 SSH_USER           SSH 用户名
-SSH_PRIVATE_KEY    SSH 私钥
+SSH_PASSWORD       SSH 登录密码
 SSH_PORT           SSH 端口，默认 22，可不填
 DEPLOY_PATH        服务器部署目录，默认 ~/photowall，可不填
 GHCR_USERNAME      GHCR 用户名；如果镜像公开，可不填
