@@ -35,8 +35,7 @@ router.post('/login', loginRateLimit, async (req: Request, res: Response): Promi
   
   if (authConfig.adminPasswordHash) {
     isValidPassword = await bcrypt.compare(password, authConfig.adminPasswordHash);
-  } else if (!authConfig.isProduction) {
-    // 开发模式：允许使用默认密码 "admin123"
+  } else if (authConfig.adminPassword) {
     isValidPassword = password === authConfig.adminPassword;
   }
 

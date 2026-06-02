@@ -17,12 +17,13 @@ function isProductionEnv(env: NodeJS.ProcessEnv): boolean {
 export function getAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
   const isProduction = isProductionEnv(env);
   const adminPasswordHash = env.ADMIN_PASSWORD_HASH || '';
+  const adminPassword = env.ADMIN_PASSWORD || (isProduction ? '' : DEFAULT_ADMIN_PASSWORD);
   const jwtSecret = env.JWT_SECRET || (isProduction ? '' : DEFAULT_JWT_SECRET);
 
   return {
     adminUsername: env.ADMIN_USERNAME || DEFAULT_ADMIN_USERNAME,
     adminPasswordHash,
-    adminPassword: isProduction ? '' : env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD,
+    adminPassword,
     jwtSecret,
     isProduction,
   };
@@ -35,8 +36,8 @@ export function assertAuthConfig(env: NodeJS.ProcessEnv = process.env): void {
   if (config.isProduction && !config.jwtSecret) {
     missing.push('JWT_SECRET');
   }
-  if (config.isProduction && !config.adminPasswordHash) {
-    missing.push('ADMIN_PASSWORD_HASH');
+  if (config.isProduction && !config.adminPasswordHash && !config.adminPassword) {
+    missing.push('ADMIN_PASSWORD_HASH or ADMIN_PASSWORD');
   }
 
   if (missing.length > 0) {
