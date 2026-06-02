@@ -1,0 +1,19 @@
+services:
+  photowall:
+    image: ${PHOTOWALL_IMAGE:-ghcr.io/wjiajian/photowall:latest}
+    container_name: photowall
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      PHOTO_UPLOAD_TMP_DIR: /tmp/photowall-uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src/data:/app/src/data
+      - photowall_upload_tmp:/tmp/photowall-uploads
+    restart: unless-stopped
+
+volumes:
+  photowall_upload_tmp:

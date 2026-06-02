@@ -163,6 +163,97 @@ docker compose down
 
 `src/data` 挂载很重要。后台上传、显隐切换、删除照片都会更新 `images-metadata.json`，挂载后容器重建不会丢状态。
 
+## GitHub Actions 部署
+
+推荐生产环境使用 GitHub Actions 构建镜像，服务器只负责拉取镜像和启动容器，避免在低配服务器上执行 `docker compose build`。
+
+工作流文件：
+
+```text
+.github/workflows/deploy.yml
+```
+
+生产 Compose 文件：
+
+```text
+docker-compose.prod.yml
+```
+
+部署流程：
+
+1. GitHub Actions 构建 Docker 镜像。
+2. 镜像推送到 GHCR。
+3. Action 通过 SSH 登录服务器。
+4. 上传 `docker-compose.prod.yml` 到服务器部署目录。
+5. 服务器执行 `docker compose pull`。
+6. 如果服务器上没有 `src/data/images-metadata.json`，就执行一次 OSS metadata 同步。
+7. 执行 `docker compose up -d` 启动服务。
+
+需要在 GitHub 仓库中配置 Secrets：
+
+```text
+SSH_HOST           服务器 IP 或域名
+SSH_USER           SSH 用户名
+SSH_PRIVATE_KEY    SSH 私钥
+SSH_PORT           SSH 端口，默认 22，可不填
+DEPLOY_PATH        服务器部署目录，默认 ~/photowall，可不填
+GHCR_USERNAME      GHCR 用户名；如果镜像公开，可不填
+GHCR_TOKEN         GHCR 访问 Token；如果镜像公开，可不填
+```
+
+需要在 GitHub 仓库中配置 Variables：
+
+```text
+VITE_OSS_PHOTOWALL_BASE_URL
+VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH
+VITE_PHOTO_UPLOAD_BATCH_MB
+```
+
+其中 `VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH` 默认 `3`，`VITE_PHOTO_UPLOAD_BATCH_MB` 默认 `30`，不特殊调整可以不填。
+
+服务器部署目录需要提前准备 `.env`：
+
+```bash
+mkdir -p ~/photowall/src/data
+cd ~/photowall
+vim .env
+```
+
+如果你用 root 部署，Action 会自动把 `src/data` 调整为容器内 `node` 用户可写，用于生成和更新 `images-metadata.json`。
+
+`.env` 至少包含：
+
+```env
+NODE_ENV=production
+PORT=3000
+CORS_ORIGIN=https://photowall.example.domain
+
+ADMIN_USERNAME=
+ADMIN_PASSWORD=
+JWT_SECRET=
+
+OSS_REGION=
+OSS_BUCKET=
+OSS_ACCESS_KEY_ID=
+OSS_ACCESS_KEY_SECRET=
+OSS_PHOTOWALL_BASE_URL=
+VITE_OSS_PHOTOWALL_BASE_URL=
+```
+
+首次部署时，如果服务器上不存在：
+
+```text
+src/data/images-metadata.json
+```
+
+Action 会自动在服务器上执行：
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm photowall npm run rebuild-oss-metadata
+```
+
+这一步会读取服务器 `.env` 里的 OSS 配置，从 OSS 同步已有照片到 metadata。之后 metadata 文件存在时，Action 会跳过同步，避免每次部署都重新扫描 OSS。
+
 ## Docker 下同步 OSS Metadata
 
 如果你使用 Docker 部署，并且 OSS 里已经有照片，推荐这样同步：

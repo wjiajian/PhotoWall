@@ -1,0 +1,117 @@
+name: Build and Deploy PhotoWall
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VITE_OSS_PHOTOWALL_BASE_URL=${{ vars.VITE_OSS_PHOTOWALL_BASE_URL }}
+            VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH=${{ vars.VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '3' }}
+            VITE_PHOTO_UPLOAD_BATCH_MB=${{ vars.VITE_PHOTO_UPLOAD_BATCH_MB || '30' }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload compose file
+        shell: bash
+        run: |
+          DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+          if [ -z "$DEPLOY_PATH" ]; then
+            DEPLOY_PATH="$HOME/photowall"
+          fi
+
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '$DEPLOY_PATH/src/data'"
+          scp -i ~/.ssh/id_ed25519 -P "${{ secrets.SSH_PORT || '22' }}" docker-compose.prod.yml "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$DEPLOY_PATH/docker-compose.prod.yml"
+
+      - name: Deploy on server
+        shell: bash
+        run: |
+          DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+          if [ -z "$DEPLOY_PATH" ]; then
+            DEPLOY_PATH="$HOME/photowall"
+          fi
+
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT || '22' }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "DEPLOY_PATH='$DEPLOY_PATH' PHOTOWALL_IMAGE='${{ needs.build.outputs.image }}' GHCR_USERNAME='${{ secrets.GHCR_USERNAME }}' GHCR_TOKEN='${{ secrets.GHCR_TOKEN }}' bash -s" <<'EOF'
+          set -euo pipefail
+
+          cd "$DEPLOY_PATH"
+          mkdir -p src/data
+          chown -R 1000:1000 src/data 2>/dev/null || chmod -R a+rwX src/data
+
+          if [ ! -f .env ]; then
+            echo "Missing $DEPLOY_PATH/.env"
+            echo "Create it on the server before deploying."
+            exit 1
+          fi
+
+          export PHOTOWALL_IMAGE
+
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USERNAME:-$USER}" --password-stdin
+          fi
+
+          docker compose -f docker-compose.prod.yml pull photowall
+
+          if [ ! -s src/data/images-metadata.json ]; then
+            echo "images-metadata.json is missing or empty, rebuilding it from OSS..."
+            docker compose -f docker-compose.prod.yml run --rm photowall npm run rebuild-oss-metadata
+          else
+            echo "images-metadata.json exists, skip OSS metadata sync."
+          fi
+
+          docker compose -f docker-compose.prod.yml up -d
+          docker image prune -f
+          EOF
