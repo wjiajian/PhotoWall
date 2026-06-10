@@ -64,6 +64,8 @@ VITE_OSS_PHOTOWALL_BASE_URL=
 - `JWT_SECRET` 请使用足够长的随机字符串。
 - `OSS_PHOTOWALL_BASE_URL` 是服务端返回图片时使用的 OSS 公开访问地址。
 - `VITE_OSS_PHOTOWALL_BASE_URL` 是前端构建时使用的 OSS 公开访问地址，通常和 `OSS_PHOTOWALL_BASE_URL` 相同。
+- `PHOTO_OSS_OPERATION_TIMEOUT_MS` OSS 单次操作的超时时间（毫秒），默认 `60000`（60 秒）。超过此限制的 OSS 网络请求会被中断。
+- `PHOTO_UPLOAD_FILE_TIMEOUT_MS` 单张照片处理的总超时时间（毫秒），默认 `300000`（5 分钟）。超过此限制的照片会被标记为失败，队列继续处理下一张。
 - 修改任何 `VITE_` 开头的变量后，需要重新构建前端或重新构建 Docker 镜像。
 
 ## 本地开发

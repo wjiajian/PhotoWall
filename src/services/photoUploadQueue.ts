@@ -2,16 +2,17 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import type OSS from 'ali-oss';
+import sharp from 'sharp';
 import {
+  buildPhotoVariantBufferFromSharp,
   buildOriginalObjectKey,
-  buildPhotoVariants,
   buildUploadThumbnailObjectKeys,
-  convertToJpegBuffer,
   createPhotoOssClient,
   deleteObjectIgnoreNotFound,
   extractPhotoDate,
   getContentTypeFromExtension,
   getFormatLabelFromExtension,
+  preparePhotoVariantSource,
   putObject,
   type PhotoOssConfig,
 } from './photoMedia.js';
@@ -87,8 +88,62 @@ const queue: string[] = [];
 let isProcessing = false;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Throttle GC hints so we don't hurt throughput/latency under load.
+const GC_MIN_INTERVAL_MS = 10_000; // at most one GC hint every 10s
+let lastGcAt = 0;
+let hasWarnedAboutMissingGc = false;
+
+// Safe GC hint: only calls global.gc when Node was started with --expose-gc.
+// On 2 GB servers this helps V8 reclaim large Buffer allocations between
+// consecutive photo uploads before memory pressure triggers OOM.
+function maybeGC(): void {
+  const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+
+  if (typeof gc !== 'function') {
+    if (!hasWarnedAboutMissingGc && process.env.NODE_ENV !== 'test') {
+      hasWarnedAboutMissingGc = true;
+      console.warn(
+        '[photoUploadQueue] global.gc is not available; start Node with --expose-gc to enable manual GC hints.',
+      );
+    }
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastGcAt < GC_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  lastGcAt = now;
+  gc();
+}
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Returns a promise that rejects with an Error after timeoutMs.
+ * If the original promise settles first, the timeout is cleared.
+ *
+ * **Cancellation note:** This wrapper does **not** cancel the underlying work
+ * (sharp/heic-convert/OSS I/O) when the timeout fires — it only rejects the
+ * raced promise. The original operation may continue consuming CPU/memory
+ * until it completes on its own. A worker-based isolation design is planned
+ * for a future iteration to provide true abort capability for stuck native
+ * tasks.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  if (timeoutMs <= 0) return promise;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  // Attach a noop catch to the original promise so that if it rejects after
+  // the timeout has already won the race, it does not become an unhandled rejection.
+  promise.catch(() => {});
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function snapshot(job: PhotoUploadJob): PhotoUploadJobSnapshot {
@@ -180,31 +235,57 @@ async function removeTempFile(filePath: string): Promise<void> {
   }
 }
 
+
 async function processOneFile(
   file: PhotoUploadTempFile,
   client: OSS,
   metadataFile: string,
+  ossTimeoutMs: number,
 ): Promise<PhotoUploadResultItem> {
   try {
     const extension = path.extname(file.filename).toLowerCase();
     const metadataRecords = readMetadataRecords(metadataFile);
     const existingRecord = metadataRecords.find(record => record.filename === file.filename);
-    const inputBuffer = await fs.promises.readFile(file.tempPath);
+
+    // Read file once; all downstream processing reuses this buffer.
+    let inputBuffer: Buffer | null = await fs.promises.readFile(file.tempPath);
     const objectKey = buildOriginalObjectKey(file.filename);
     const photoDate = await extractPhotoDate(inputBuffer, new Date().toISOString());
+
     const contentType = file.mimetype?.startsWith('image/')
       ? file.mimetype
       : getContentTypeFromExtension(extension);
 
-    await putObject(client, objectKey, inputBuffer, contentType);
+    // Upload original to OSS while we hold the buffer
+    await putObject(client, objectKey, inputBuffer, contentType, ossTimeoutMs);
 
     const thumbnailKeys = buildUploadThumbnailObjectKeys(file.filename);
-    const jpegBuffer = await convertToJpegBuffer(inputBuffer, extension);
-    const variants = await buildPhotoVariants(jpegBuffer);
+    let photoWidth = existingRecord?.width;
+    let photoHeight = existingRecord?.height;
 
-    await putObject(client, thumbnailKeys.fullKey, variants.fullBuffer, 'image/jpeg');
-    await putObject(client, thumbnailKeys.mediumKey, variants.mediumBuffer, 'image/jpeg');
-    await putObject(client, thumbnailKeys.tinyKey, variants.tinyBuffer, 'image/jpeg');
+    {
+      const variantSource = await preparePhotoVariantSource(inputBuffer, extension);
+      photoWidth = variantSource.width || photoWidth;
+      photoHeight = variantSource.height || photoHeight;
+
+      // HEIC/HEIF: variantSource.buffer is a fresh JPEG, so the raw upload
+      // buffer can be released now. Other formats reuse the same Buffer object,
+      // so memory stays pinned until variantSource leaves scope below.
+      inputBuffer = null;
+
+      // Share one sharp decode across all three variants via clone()
+      const base = sharp(variantSource.buffer);
+      const [fullBuf, mediumBuf, tinyBuf] = await Promise.all([
+        buildPhotoVariantBufferFromSharp(base, 'full'),
+        buildPhotoVariantBufferFromSharp(base, 'medium'),
+        buildPhotoVariantBufferFromSharp(base, 'tiny'),
+      ]);
+
+      await putObject(client, thumbnailKeys.fullKey, fullBuf, 'image/jpeg', ossTimeoutMs);
+      await putObject(client, thumbnailKeys.mediumKey, mediumBuf, 'image/jpeg', ossTimeoutMs);
+      await putObject(client, thumbnailKeys.tinyKey, tinyBuf, 'image/jpeg', ossTimeoutMs);
+    }
+    maybeGC();
 
     const srcFull = `/${thumbnailKeys.fullKey}`;
     const srcMedium = `/${thumbnailKeys.mediumKey}`;
@@ -225,7 +306,7 @@ async function processOneFile(
     }
 
     for (const key of previousKeys) {
-      await deleteObjectIgnoreNotFound(client, key);
+      await deleteObjectIgnoreNotFound(client, key, ossTimeoutMs);
     }
 
     upsertMetadataRecordByFilename(metadataRecords, {
@@ -234,8 +315,8 @@ async function processOneFile(
       src: srcFull,
       srcMedium,
       srcTiny,
-      width: variants.width || existingRecord?.width,
-      height: variants.height || existingRecord?.height,
+      width: photoWidth,
+      height: photoHeight,
       size: file.size,
       format: getFormatLabelFromExtension(extension),
       date: photoDate || undefined,
@@ -257,6 +338,11 @@ async function processOneFile(
 
 async function processJob(job: PhotoUploadJob): Promise<void> {
   const client = createPhotoOssClient(job.ossConfig);
+  const ossTimeoutMs = job.ossConfig.timeoutMs;
+  const parsedFileTimeout = Number.parseInt(process.env.PHOTO_UPLOAD_FILE_TIMEOUT_MS || '300000', 10);
+  const fileTimeoutMs = Number.isFinite(parsedFileTimeout) && parsedFileTimeout > 0 ? parsedFileTimeout : 300000;
+  const fileTimeoutSec = Math.round(fileTimeoutMs / 1000);
+
   job.status = 'processing';
   job.updatedAt = nowIso();
   job.message = '正在处理照片';
@@ -266,17 +352,24 @@ async function processJob(job: PhotoUploadJob): Promise<void> {
     job.updatedAt = nowIso();
 
     try {
-      const result = await processOneFile(file, client, job.metadataFile);
+      const promise = processOneFile(file, client, job.metadataFile, ossTimeoutMs);
+      const result = await withTimeout(
+        promise,
+        fileTimeoutMs,
+        `照片处理超时（超过 ${fileTimeoutSec} 秒）`,
+      );
       job.uploaded.push(result);
     } catch (error) {
       await removeTempFile(file.tempPath);
       job.failed.push({
         filename: file.filename,
-        error: error instanceof Error ? error.message : '上传到 OSS 失败',
+        error: error instanceof Error ? error.message : '上传照片失败',
       });
     } finally {
       job.processed += 1;
       job.updatedAt = nowIso();
+      // Hint V8 to reclaim large buffers before the next file
+      maybeGC();
     }
   }
 

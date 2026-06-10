@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "start": "ts-node server.ts",
-    "serve": "node dist-server/server.js",
+    "serve": "node --expose-gc dist-server/server.js",
     "build:server": "tsc -p tsconfig.server.json",
     "lint": "eslint .",
     "preview": "vite preview",
