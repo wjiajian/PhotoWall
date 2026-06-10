@@ -16,7 +16,11 @@ const sharpConcurrency = Number.isFinite(parsedSharpConcurrency) && parsedSharpC
   : 1;
 
 sharp.concurrency(sharpConcurrency);
-sharp.cache({ memory: 64, files: 0, items: 32 });
+
+// Minimal cache: on 2GB servers, every MB counts. Sharp's internal libvips
+// already buffers decoded pixels; this cache only holds intermediate pipeline
+// results. 16 MB is enough for repeated metadata reads while staying lean.
+sharp.cache({ memory: 16, files: 0, items: 16 });
 
 export interface PhotoOssConfig {
   region: string;
@@ -24,8 +28,8 @@ export interface PhotoOssConfig {
   accessKeyId: string;
   accessKeySecret: string;
   endpoint: string;
+  timeoutMs: number;
 }
-
 export function createPhotoOssClient(config: PhotoOssConfig): OSS {
   return new OSS({
     region: config.region,
@@ -34,6 +38,7 @@ export function createPhotoOssClient(config: PhotoOssConfig): OSS {
     accessKeySecret: config.accessKeySecret,
     endpoint: config.endpoint || undefined,
     secure: true,
+    timeout: config.timeoutMs,
   });
 }
 
@@ -76,18 +81,31 @@ export function getFormatLabelFromExtension(extension: string): string {
   return normalized.replace('.', '').toUpperCase();
 }
 
-export async function putObject(client: OSS, key: string, body: Buffer, contentType: string): Promise<void> {
+export async function putObject(
+  client: OSS,
+  key: string,
+  body: Buffer,
+  contentType: string,
+  timeoutMs?: number,
+): Promise<void> {
   await client.put(key, body, {
     headers: {
       'Content-Type': contentType,
       'Cache-Control': 'public, max-age=31536000, immutable',
     },
+    ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
   });
 }
 
-export async function deleteObjectIgnoreNotFound(client: OSS, key: string): Promise<void> {
+export async function deleteObjectIgnoreNotFound(
+  client: OSS,
+  key: string,
+  timeoutMs?: number,
+): Promise<void> {
   try {
-    await client.delete(key);
+    await client.delete(key, {
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+    });
   } catch (error) {
     const status = (error as { status?: number }).status;
     const code = (error as { code?: string }).code;
@@ -98,59 +116,69 @@ export async function deleteObjectIgnoreNotFound(client: OSS, key: string): Prom
   }
 }
 
-export async function convertToJpegBuffer(inputBuffer: Buffer, extension: string): Promise<Buffer> {
+export type PhotoVariantKind = 'full' | 'medium' | 'tiny';
+
+export interface PhotoVariantSource {
+  buffer: Buffer;
+  width: number;
+  height: number;
+}
+
+/**
+ * Prepare the source buffer used for thumbnail generation.
+ *
+ * HEIC/HEIF still needs a JPEG staging buffer because heic-convert is the
+ * decoder in this project. Sharp-supported formats are passed through directly
+ * to avoid an extra full-size JPEG allocation.
+ */
+export async function preparePhotoVariantSource(
+  inputBuffer: Buffer,
+  extension: string,
+): Promise<PhotoVariantSource> {
   const isHeic = extension === '.heic' || extension === '.heif';
+  let sourceBuffer = inputBuffer;
+
   if (isHeic) {
     const converted = await heicConvert({
       buffer: inputBuffer,
       format: 'JPEG',
       quality: 0.9,
     });
-    return Buffer.from(converted);
+    // Share the underlying ArrayBuffer rather than copying — saves a ~20 MB
+    // duplicate allocation for high-resolution HEIC photos.
+    sourceBuffer = Buffer.from(converted.buffer, converted.byteOffset, converted.byteLength);
   }
 
-  if (extension === '.jpg' || extension === '.jpeg') {
-    return inputBuffer;
-  }
+  const { width, height } = await sharp(sourceBuffer).metadata();
 
-  return await sharp(inputBuffer)
-    .jpeg({ quality: 92, mozjpeg: true })
-    .toBuffer();
+  return {
+    buffer: sourceBuffer,
+    width: width || 0,
+    height: height || 0,
+  };
 }
 
-export async function buildPhotoVariants(fullSourceBuffer: Buffer): Promise<{
-  fullBuffer: Buffer;
-  mediumBuffer: Buffer;
-  tinyBuffer: Buffer;
-  width: number;
-  height: number;
-}> {
-  const fullBuffer = await sharp(fullSourceBuffer)
-    .jpeg({ quality: 92, mozjpeg: true })
-    .toBuffer();
+export async function buildPhotoVariantBuffer(
+  sourceBuffer: Buffer,
+  kind: PhotoVariantKind,
+): Promise<Buffer> {
+  if (kind === 'full') {
+    return await sharp(sourceBuffer)
+      .jpeg({ quality: 92, mozjpeg: true })
+      .toBuffer();
+  }
 
-  const fullSharp = sharp(fullBuffer);
-  const info = await fullSharp.metadata();
+  if (kind === 'medium') {
+    return await sharp(sourceBuffer)
+      .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80, mozjpeg: true })
+      .toBuffer();
+  }
 
-  const mediumBuffer = await fullSharp
-    .clone()
-    .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 80, mozjpeg: true })
-    .toBuffer();
-
-  const tinyBuffer = await fullSharp
-    .clone()
+  return await sharp(sourceBuffer)
     .resize(50, 50, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 60 })
     .toBuffer();
-
-  return {
-    fullBuffer,
-    mediumBuffer,
-    tinyBuffer,
-    width: info.width || 0,
-    height: info.height || 0,
-  };
 }
 
 function formatDate(input: string | Date | undefined | null): string | null {

@@ -140,12 +140,14 @@ function buildVisibilityKeyFromInput(driveItemId: unknown, filename: unknown): s
 }
 
 function getOssConfig(): PhotoOssConfig {
+  const parsedOpsTimeout = Number.parseInt(process.env.PHOTO_OSS_OPERATION_TIMEOUT_MS || '60000', 10);
   return {
     region: process.env.OSS_REGION || '',
     bucket: process.env.OSS_BUCKET || '',
     accessKeyId: process.env.OSS_ACCESS_KEY_ID || '',
     accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || '',
     endpoint: process.env.OSS_ENDPOINT || '',
+    timeoutMs: Number.isFinite(parsedOpsTimeout) && parsedOpsTimeout > 0 ? parsedOpsTimeout : 60000,
   };
 }
 
@@ -539,7 +541,7 @@ router.delete('/:filename', authMiddleware, async (req: Request, res: Response):
     const client = createPhotoOssClient(ossConfig);
     for (const key of ossKeys) {
       try {
-        await deleteObjectIgnoreNotFound(client, key);
+        await deleteObjectIgnoreNotFound(client, key, ossConfig.timeoutMs);
         deletedOssCount += 1;
       } catch (error) {
         console.error(`Failed to delete OSS object ${key}:`, error);

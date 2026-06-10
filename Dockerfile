@@ -37,4 +37,4 @@ RUN mkdir -p /app/src/data /tmp/photowall-uploads \
 
 USER node
 EXPOSE 3000
-CMD ["node", "dist-server/server.js"]
+CMD ["node", "--expose-gc", "--max-old-space-size=768", "dist-server/server.js"]
