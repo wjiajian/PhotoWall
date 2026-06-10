@@ -2,8 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import type OSS from 'ali-oss';
+import sharp from 'sharp';
 import {
-  buildPhotoVariantBuffer,
+  buildPhotoVariantBufferFromSharp,
   buildOriginalObjectKey,
   buildUploadThumbnailObjectKeys,
   createPhotoOssClient,
@@ -13,7 +14,6 @@ import {
   getFormatLabelFromExtension,
   preparePhotoVariantSource,
   putObject,
-  type PhotoVariantKind,
   type PhotoOssConfig,
 } from './photoMedia.js';
 
@@ -88,13 +88,34 @@ const queue: string[] = [];
 let isProcessing = false;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Throttle GC hints so we don't hurt throughput/latency under load.
+const GC_MIN_INTERVAL_MS = 10_000; // at most one GC hint every 10s
+let lastGcAt = 0;
+let hasWarnedAboutMissingGc = false;
+
 // Safe GC hint: only calls global.gc when Node was started with --expose-gc.
 // On 2 GB servers this helps V8 reclaim large Buffer allocations between
 // consecutive photo uploads before memory pressure triggers OOM.
 function maybeGC(): void {
-  if (typeof globalThis.gc === 'function') {
-    globalThis.gc();
+  const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+
+  if (typeof gc !== 'function') {
+    if (!hasWarnedAboutMissingGc && process.env.NODE_ENV !== 'test') {
+      hasWarnedAboutMissingGc = true;
+      console.warn(
+        '[photoUploadQueue] global.gc is not available; start Node with --expose-gc to enable manual GC hints.',
+      );
+    }
+    return;
   }
+
+  const now = Date.now();
+  if (now - lastGcAt < GC_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  lastGcAt = now;
+  gc();
 }
 function nowIso(): string {
   return new Date().toISOString();
@@ -103,6 +124,13 @@ function nowIso(): string {
 /**
  * Returns a promise that rejects with an Error after timeoutMs.
  * If the original promise settles first, the timeout is cleared.
+ *
+ * **Cancellation note:** This wrapper does **not** cancel the underlying work
+ * (sharp/heic-convert/OSS I/O) when the timeout fires — it only rejects the
+ * raced promise. The original operation may continue consuming CPU/memory
+ * until it completes on its own. A worker-based isolation design is planned
+ * for a future iteration to provide true abort capability for stuck native
+ * tasks.
  */
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   if (timeoutMs <= 0) return promise;
@@ -207,21 +235,6 @@ async function removeTempFile(filePath: string): Promise<void> {
   }
 }
 
-async function buildAndUploadPhotoVariant(
-  client: OSS,
-  sourceBuffer: Buffer,
-  kind: PhotoVariantKind,
-  key: string,
-  timeoutMs: number,
-): Promise<void> {
-  let variantBuffer: Buffer | null = null;
-  try {
-    variantBuffer = await buildPhotoVariantBuffer(sourceBuffer, kind);
-    await putObject(client, key, variantBuffer, 'image/jpeg', timeoutMs);
-  } finally {
-    variantBuffer = null;
-  }
-}
 
 async function processOneFile(
   file: PhotoUploadTempFile,
@@ -260,9 +273,17 @@ async function processOneFile(
       // so memory stays pinned until variantSource leaves scope below.
       inputBuffer = null;
 
-      await buildAndUploadPhotoVariant(client, variantSource.buffer, 'full', thumbnailKeys.fullKey, ossTimeoutMs);
-      await buildAndUploadPhotoVariant(client, variantSource.buffer, 'medium', thumbnailKeys.mediumKey, ossTimeoutMs);
-      await buildAndUploadPhotoVariant(client, variantSource.buffer, 'tiny', thumbnailKeys.tinyKey, ossTimeoutMs);
+      // Share one sharp decode across all three variants via clone()
+      const base = sharp(variantSource.buffer);
+      const [fullBuf, mediumBuf, tinyBuf] = await Promise.all([
+        buildPhotoVariantBufferFromSharp(base, 'full'),
+        buildPhotoVariantBufferFromSharp(base, 'medium'),
+        buildPhotoVariantBufferFromSharp(base, 'tiny'),
+      ]);
+
+      await putObject(client, thumbnailKeys.fullKey, fullBuf, 'image/jpeg', ossTimeoutMs);
+      await putObject(client, thumbnailKeys.mediumKey, mediumBuf, 'image/jpeg', ossTimeoutMs);
+      await putObject(client, thumbnailKeys.tinyKey, tinyBuf, 'image/jpeg', ossTimeoutMs);
     }
     maybeGC();
 

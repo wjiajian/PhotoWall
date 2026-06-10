@@ -162,20 +162,38 @@ export async function buildPhotoVariantBuffer(
   sourceBuffer: Buffer,
   kind: PhotoVariantKind,
 ): Promise<Buffer> {
+  const base = sharp(sourceBuffer);
+  return buildPhotoVariantBufferFromSharp(base, kind);
+}
+
+/**
+ * Build a photo variant from a pre-existing sharp instance.
+ *
+ * Prefer this over {@link buildPhotoVariantBuffer} when generating multiple
+ * variants from the same source: the base instance decodes the image once,
+ * and each variant clones the pipeline so the decode work is shared.
+ */
+export async function buildPhotoVariantBufferFromSharp(
+  base: sharp.Sharp,
+  kind: PhotoVariantKind,
+): Promise<Buffer> {
   if (kind === 'full') {
-    return await sharp(sourceBuffer)
+    return await base
+      .clone()
       .jpeg({ quality: 92, mozjpeg: true })
       .toBuffer();
   }
 
   if (kind === 'medium') {
-    return await sharp(sourceBuffer)
+    return await base
+      .clone()
       .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 80, mozjpeg: true })
       .toBuffer();
   }
 
-  return await sharp(sourceBuffer)
+  return await base
+    .clone()
     .resize(50, 50, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 60 })
     .toBuffer();
