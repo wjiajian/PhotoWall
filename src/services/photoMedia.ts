@@ -1,4 +1,5 @@
 import { createRequire } from 'module';
+import { promises as fsPromises } from 'fs';
 import sharp from 'sharp';
 import exifr from 'exifr';
 import OSS from 'ali-oss';
@@ -19,8 +20,36 @@ sharp.concurrency(sharpConcurrency);
 
 // Minimal cache: on 2GB servers, every MB counts. Sharp's internal libvips
 // already buffers decoded pixels; this cache only holds intermediate pipeline
-// results. 16 MB is enough for repeated metadata reads while staying lean.
-sharp.cache({ memory: 16, files: 0, items: 16 });
+// results. 8 MB is enough for repeated metadata reads while staying lean.
+sharp.cache({ memory: 8, files: 0, items: 8 });
+
+const parsedMaxInputPixels = Number.parseInt(process.env.PHOTO_PROCESS_MAX_PIXELS || '30000000', 10);
+const maxInputPixels = Number.isFinite(parsedMaxInputPixels) && parsedMaxInputPixels > 0
+  ? parsedMaxInputPixels
+  : 30000000;
+const parsedHeicMaxMb = Number.parseInt(process.env.PHOTO_HEIC_MAX_MB || '15', 10);
+const maxHeicBytes = (Number.isFinite(parsedHeicMaxMb) && parsedHeicMaxMb > 0 ? parsedHeicMaxMb : 15) * 1024 * 1024;
+
+const parsedFullMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_FULL_MAX_PX || '0', 10);
+const fullMaxPx = Number.isFinite(parsedFullMaxPx) && parsedFullMaxPx > 0 ? parsedFullMaxPx : 0;
+const parsedMediumMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_MEDIUM_MAX_PX || '800', 10);
+const mediumMaxPx = Number.isFinite(parsedMediumMaxPx) && parsedMediumMaxPx > 0 ? parsedMediumMaxPx : 800;
+const parsedTinyMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_TINY_MAX_PX || '50', 10);
+const tinyMaxPx = Number.isFinite(parsedTinyMaxPx) && parsedTinyMaxPx > 0 ? parsedTinyMaxPx : 50;
+
+const parsedFullQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_FULL_QUALITY || '92', 10);
+const fullQuality = Number.isFinite(parsedFullQuality) && parsedFullQuality > 0 ? parsedFullQuality : 92;
+const parsedMediumQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_MEDIUM_QUALITY || '80', 10);
+const mediumQuality = Number.isFinite(parsedMediumQuality) && parsedMediumQuality > 0 ? parsedMediumQuality : 80;
+const parsedTinyQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_TINY_QUALITY || '60', 10);
+const tinyQuality = Number.isFinite(parsedTinyQuality) && parsedTinyQuality > 0 ? parsedTinyQuality : 60;
+
+export type PhotoInput = Buffer | string;
+type OssPutBody = Parameters<OSS['put']>[1];
+
+function createSharpInput(input: PhotoInput): sharp.Sharp {
+  return sharp(input, { limitInputPixels: maxInputPixels });
+}
 
 export interface PhotoOssConfig {
   region: string;
@@ -84,7 +113,7 @@ export function getFormatLabelFromExtension(extension: string): string {
 export async function putObject(
   client: OSS,
   key: string,
-  body: Buffer,
+  body: OssPutBody,
   contentType: string,
   timeoutMs?: number,
 ): Promise<void> {
@@ -119,7 +148,7 @@ export async function deleteObjectIgnoreNotFound(
 export type PhotoVariantKind = 'full' | 'medium' | 'tiny';
 
 export interface PhotoVariantSource {
-  buffer: Buffer;
+  input: PhotoInput;
   width: number;
   height: number;
 }
@@ -132,13 +161,20 @@ export interface PhotoVariantSource {
  * to avoid an extra full-size JPEG allocation.
  */
 export async function preparePhotoVariantSource(
-  inputBuffer: Buffer,
+  input: PhotoInput,
   extension: string,
+  inputSizeBytes?: number,
 ): Promise<PhotoVariantSource> {
   const isHeic = extension === '.heic' || extension === '.heif';
-  let sourceBuffer = inputBuffer;
+  let sourceInput = input;
 
   if (isHeic) {
+    if (inputSizeBytes !== undefined && inputSizeBytes > maxHeicBytes) {
+      throw new Error(`HEIC/HEIF 文件不能超过 ${Math.round(maxHeicBytes / 1024 / 1024)}MB`);
+    }
+    const inputBuffer = typeof input === 'string'
+      ? await fsPromises.readFile(input)
+      : input;
     const converted = await heicConvert({
       buffer: inputBuffer,
       format: 'JPEG',
@@ -146,23 +182,23 @@ export async function preparePhotoVariantSource(
     });
     // Share the underlying ArrayBuffer rather than copying — saves a ~20 MB
     // duplicate allocation for high-resolution HEIC photos.
-    sourceBuffer = Buffer.from(converted.buffer, converted.byteOffset, converted.byteLength);
+    sourceInput = Buffer.from(converted.buffer, converted.byteOffset, converted.byteLength);
   }
 
-  const { width, height } = await sharp(sourceBuffer).metadata();
+  const { width, height } = await createSharpInput(sourceInput).metadata();
 
   return {
-    buffer: sourceBuffer,
+    input: sourceInput,
     width: width || 0,
     height: height || 0,
   };
 }
 
 export async function buildPhotoVariantBuffer(
-  sourceBuffer: Buffer,
+  sourceInput: PhotoInput,
   kind: PhotoVariantKind,
 ): Promise<Buffer> {
-  const base = sharp(sourceBuffer);
+  const base = createSharpInput(sourceInput);
   return buildPhotoVariantBufferFromSharp(base, kind);
 }
 
@@ -178,24 +214,25 @@ export async function buildPhotoVariantBufferFromSharp(
   kind: PhotoVariantKind,
 ): Promise<Buffer> {
   if (kind === 'full') {
-    return await base
-      .clone()
-      .jpeg({ quality: 92, mozjpeg: true })
-      .toBuffer();
+    const pipeline = base.clone();
+    if (fullMaxPx > 0) {
+      pipeline.resize(fullMaxPx, fullMaxPx, { fit: 'inside', withoutEnlargement: true });
+    }
+    return await pipeline.jpeg({ quality: fullQuality, mozjpeg: true }).toBuffer();
   }
 
   if (kind === 'medium') {
     return await base
       .clone()
-      .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 80, mozjpeg: true })
+      .resize(mediumMaxPx, mediumMaxPx, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: mediumQuality, mozjpeg: true })
       .toBuffer();
   }
 
   return await base
     .clone()
-    .resize(50, 50, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 60 })
+    .resize(tinyMaxPx, tinyMaxPx, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: tinyQuality })
     .toBuffer();
 }
 
@@ -207,9 +244,9 @@ function formatDate(input: string | Date | undefined | null): string | null {
   return `${date.getFullYear()}:${pad(date.getMonth() + 1)}:${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export async function extractPhotoDate(sourceBuffer: Buffer, fallbackIsoDate?: string): Promise<string | null> {
+export async function extractPhotoDate(sourceInput: PhotoInput, fallbackIsoDate?: string): Promise<string | null> {
   try {
-    const meta = await exifr.parse(sourceBuffer);
+    const meta = await exifr.parse(sourceInput);
     const candidate = meta?.DateTimeOriginal || meta?.CreateDate || meta?.ModifyDate;
     const parsed = formatDate(candidate);
     if (parsed) return parsed;

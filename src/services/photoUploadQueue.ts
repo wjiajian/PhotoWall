@@ -2,9 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import type OSS from 'ali-oss';
-import sharp from 'sharp';
 import {
-  buildPhotoVariantBufferFromSharp,
+  buildPhotoVariantBuffer,
   buildOriginalObjectKey,
   buildUploadThumbnailObjectKeys,
   createPhotoOssClient,
@@ -242,48 +241,42 @@ async function processOneFile(
   metadataFile: string,
   ossTimeoutMs: number,
 ): Promise<PhotoUploadResultItem> {
+  const uploadedKeys = new Set<string>();
+
   try {
     const extension = path.extname(file.filename).toLowerCase();
     const metadataRecords = readMetadataRecords(metadataFile);
     const existingRecord = metadataRecords.find(record => record.filename === file.filename);
 
-    // Read file once; all downstream processing reuses this buffer.
-    let inputBuffer: Buffer | null = await fs.promises.readFile(file.tempPath);
     const objectKey = buildOriginalObjectKey(file.filename);
-    const photoDate = await extractPhotoDate(inputBuffer, new Date().toISOString());
+    const photoDate = await extractPhotoDate(file.tempPath, new Date().toISOString());
 
     const contentType = file.mimetype?.startsWith('image/')
       ? file.mimetype
       : getContentTypeFromExtension(extension);
 
-    // Upload original to OSS while we hold the buffer
-    await putObject(client, objectKey, inputBuffer, contentType, ossTimeoutMs);
+    await putObject(client, objectKey, fs.createReadStream(file.tempPath), contentType, ossTimeoutMs);
+    uploadedKeys.add(objectKey);
 
     const thumbnailKeys = buildUploadThumbnailObjectKeys(file.filename);
     let photoWidth = existingRecord?.width;
     let photoHeight = existingRecord?.height;
 
     {
-      const variantSource = await preparePhotoVariantSource(inputBuffer, extension);
+      const variantSource = await preparePhotoVariantSource(file.tempPath, extension, file.size);
       photoWidth = variantSource.width || photoWidth;
       photoHeight = variantSource.height || photoHeight;
 
-      // HEIC/HEIF: variantSource.buffer is a fresh JPEG, so the raw upload
-      // buffer can be released now. Other formats reuse the same Buffer object,
-      // so memory stays pinned until variantSource leaves scope below.
-      inputBuffer = null;
-
-      // Share one sharp decode across all three variants via clone()
-      const base = sharp(variantSource.buffer);
-      const [fullBuf, mediumBuf, tinyBuf] = await Promise.all([
-        buildPhotoVariantBufferFromSharp(base, 'full'),
-        buildPhotoVariantBufferFromSharp(base, 'medium'),
-        buildPhotoVariantBufferFromSharp(base, 'tiny'),
-      ]);
-
-      await putObject(client, thumbnailKeys.fullKey, fullBuf, 'image/jpeg', ossTimeoutMs);
-      await putObject(client, thumbnailKeys.mediumKey, mediumBuf, 'image/jpeg', ossTimeoutMs);
-      await putObject(client, thumbnailKeys.tinyKey, tinyBuf, 'image/jpeg', ossTimeoutMs);
+      for (const variant of [
+        { kind: 'full' as const, key: thumbnailKeys.fullKey },
+        { kind: 'medium' as const, key: thumbnailKeys.mediumKey },
+        { kind: 'tiny' as const, key: thumbnailKeys.tinyKey },
+      ]) {
+        const variantBuffer = await buildPhotoVariantBuffer(variantSource.input, variant.kind);
+        await putObject(client, variant.key, variantBuffer, 'image/jpeg', ossTimeoutMs);
+        uploadedKeys.add(variant.key);
+        maybeGC();
+      }
     }
     maybeGC();
 
@@ -331,6 +324,15 @@ async function processOneFile(
       size: file.size,
       src: srcFull,
     };
+  } catch (error) {
+    for (const key of uploadedKeys) {
+      try {
+        await deleteObjectIgnoreNotFound(client, key, ossTimeoutMs);
+      } catch (cleanupError) {
+        console.error(`Failed to rollback uploaded OSS object ${key}:`, cleanupError);
+      }
+    }
+    throw error;
   } finally {
     await removeTempFile(file.tempPath);
   }
