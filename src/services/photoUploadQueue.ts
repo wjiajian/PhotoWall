@@ -3,10 +3,11 @@ import path from 'path';
 import crypto from 'crypto';
 import type OSS from 'ali-oss';
 import {
-  buildPhotoVariantBuffer,
+  buildPhotoVariantBufferFromSharp,
   buildOriginalObjectKey,
   buildUploadThumbnailObjectKeys,
   createPhotoOssClient,
+  createSharpInput,
   deleteObjectIgnoreNotFound,
   extractPhotoDate,
   getContentTypeFromExtension,
@@ -266,13 +267,14 @@ async function processOneFile(
       const variantSource = await preparePhotoVariantSource(file.tempPath, extension, file.size);
       photoWidth = variantSource.width || photoWidth;
       photoHeight = variantSource.height || photoHeight;
+      const base = createSharpInput(variantSource.input);
 
       for (const variant of [
         { kind: 'full' as const, key: thumbnailKeys.fullKey },
         { kind: 'medium' as const, key: thumbnailKeys.mediumKey },
         { kind: 'tiny' as const, key: thumbnailKeys.tinyKey },
       ]) {
-        const variantBuffer = await buildPhotoVariantBuffer(variantSource.input, variant.kind);
+        const variantBuffer = await buildPhotoVariantBufferFromSharp(base, variant.kind);
         await putObject(client, variant.key, variantBuffer, 'image/jpeg', ossTimeoutMs);
         uploadedKeys.add(variant.key);
         maybeGC();

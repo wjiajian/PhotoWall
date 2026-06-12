@@ -30,24 +30,26 @@ const maxInputPixels = Number.isFinite(parsedMaxInputPixels) && parsedMaxInputPi
 const parsedHeicMaxMb = Number.parseInt(process.env.PHOTO_HEIC_MAX_MB || '15', 10);
 const maxHeicBytes = (Number.isFinite(parsedHeicMaxMb) && parsedHeicMaxMb > 0 ? parsedHeicMaxMb : 15) * 1024 * 1024;
 
-const parsedFullMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_FULL_MAX_PX || '0', 10);
-const fullMaxPx = Number.isFinite(parsedFullMaxPx) && parsedFullMaxPx > 0 ? parsedFullMaxPx : 0;
-const parsedMediumMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_MEDIUM_MAX_PX || '800', 10);
-const mediumMaxPx = Number.isFinite(parsedMediumMaxPx) && parsedMediumMaxPx > 0 ? parsedMediumMaxPx : 800;
-const parsedTinyMaxPx = Number.parseInt(process.env.PHOTO_THUMBNAIL_TINY_MAX_PX || '50', 10);
-const tinyMaxPx = Number.isFinite(parsedTinyMaxPx) && parsedTinyMaxPx > 0 ? parsedTinyMaxPx : 50;
+function parsePositiveIntEnv(name: string, fallback: number, max?: number): number {
+  const parsed = Number.parseInt(process.env[name] || String(fallback), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return max !== undefined ? Math.min(parsed, max) : parsed;
+}
 
-const parsedFullQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_FULL_QUALITY || '92', 10);
-const fullQuality = Number.isFinite(parsedFullQuality) && parsedFullQuality > 0 ? parsedFullQuality : 92;
-const parsedMediumQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_MEDIUM_QUALITY || '80', 10);
-const mediumQuality = Number.isFinite(parsedMediumQuality) && parsedMediumQuality > 0 ? parsedMediumQuality : 80;
-const parsedTinyQuality = Number.parseInt(process.env.PHOTO_THUMBNAIL_TINY_QUALITY || '60', 10);
-const tinyQuality = Number.isFinite(parsedTinyQuality) && parsedTinyQuality > 0 ? parsedTinyQuality : 60;
+const fullMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_FULL_MAX_PX', 0);
+const mediumMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_MEDIUM_MAX_PX', 800);
+const tinyMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_TINY_MAX_PX', 50);
+
+const fullQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_FULL_QUALITY', 92, 100);
+const mediumQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_MEDIUM_QUALITY', 80, 100);
+const tinyQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_TINY_QUALITY', 60, 100);
 
 export type PhotoInput = Buffer | string;
 type OssPutBody = Parameters<OSS['put']>[1];
 
-function createSharpInput(input: PhotoInput): sharp.Sharp {
+export function createSharpInput(input: PhotoInput): sharp.Sharp {
   return sharp(input, { limitInputPixels: maxInputPixels });
 }
 
