@@ -52,15 +52,15 @@ const {
   PHOTO_EXTENSION_REGEX: RegExp;
   isSupportedPhotoExtension: (ext: string) => boolean;
 };
-const parsedUploadLimitMb = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_MB || '50', 10);
-const MAX_UPLOAD_MB = Number.isFinite(parsedUploadLimitMb) && parsedUploadLimitMb > 0 ? parsedUploadLimitMb : 50;
+const parsedUploadLimitMb = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_MB || '25', 10);
+const MAX_UPLOAD_MB = Number.isFinite(parsedUploadLimitMb) && parsedUploadLimitMb > 0 ? parsedUploadLimitMb : 25;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const parsedMaxFilesPerBatch = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '3', 10);
+const parsedMaxFilesPerBatch = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '1', 10);
 const MAX_FILES_PER_UPLOAD_BATCH = Number.isFinite(parsedMaxFilesPerBatch) && parsedMaxFilesPerBatch > 0
   ? parsedMaxFilesPerBatch
-  : 3;
-const parsedMaxBatchMb = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_BATCH_MB || '60', 10);
-const MAX_UPLOAD_BATCH_MB = Number.isFinite(parsedMaxBatchMb) && parsedMaxBatchMb > 0 ? parsedMaxBatchMb : 60;
+  : 1;
+const parsedMaxBatchMb = Number.parseInt(process.env.PHOTO_UPLOAD_MAX_BATCH_MB || '25', 10);
+const MAX_UPLOAD_BATCH_MB = Number.isFinite(parsedMaxBatchMb) && parsedMaxBatchMb > 0 ? parsedMaxBatchMb : 25;
 const MAX_UPLOAD_BATCH_BYTES = MAX_UPLOAD_BATCH_MB * 1024 * 1024;
 const UPLOAD_TMP_DIR = process.env.PHOTO_UPLOAD_TMP_DIR
   ? path.resolve(process.env.PHOTO_UPLOAD_TMP_DIR)
