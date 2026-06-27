@@ -1,3 +1,5 @@
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { Worker } from 'worker_threads';
 import {
   buildPhotoVariantsFromTemp,
@@ -19,10 +21,12 @@ import type {
 
 const workerUrl = new URL('./photoImageWorker.js', import.meta.url);
 
-// ts-node 直跑 .ts 源码时（npm run start 开发模式）不存在编译后的 .js worker 文件，
-// 退回到主线程内联处理（开发环境可接受短暂阻塞）。也可用 PHOTO_WORKER_DISABLED=1 强制关闭。
+// worker 启用与否：以显式环境变量为准（PHOTO_WORKER_DISABLED=1 强制关闭）。
+// 兜底判据是「编译产物是否真实存在」而非源码扩展名——这样不与具体的转译/打包
+// 布局耦合：无论产物被放到哪里，只要 worker 文件不在（如 ts-node 直跑源码的
+// 开发模式），就自动退回主线程内联处理；存在则使用 worker。
 const workerDisabled =
-  process.env.PHOTO_WORKER_DISABLED === '1' || import.meta.url.endsWith('.ts');
+  process.env.PHOTO_WORKER_DISABLED === '1' || !fs.existsSync(fileURLToPath(workerUrl));
 
 const parsedRecycle = Number.parseInt(process.env.PHOTO_WORKER_RECYCLE_EVERY || '20', 10);
 const recycleEvery = Number.isFinite(parsedRecycle) && parsedRecycle > 0 ? parsedRecycle : 20;
@@ -82,20 +86,32 @@ function maybeRecycle(): void {
   }
 }
 
+/**
+ * 主线程内联兜底（仅用于开发/显式禁用 worker 的场景）。
+ *
+ * ⚠️ 重要限制：与 worker 路径不同，这里**无法真正中断**底层原生任务。超时只是
+ * 让调用方的 Promise 以"超时"拒绝，而 buildPhotoVariantsFromTemp（heic-convert /
+ * sharp）会在后台**继续占用 CPU/内存直到自行跑完**——即出现"已报超时但 CPU 仍忙"
+ * 的情况，对大图尤其浪费资源。这是退化路径可接受的代价；生产环境请始终走 worker
+ * 路径（worker.terminate() 才能真正中断）。超时触发时打 warn 以免该现象被静默掩盖。
+ */
 function runInThread(
   input: BuildPhotoVariantsInput,
   timeoutMs: number,
 ): Promise<PhotoVariantBundle> {
   const work = buildPhotoVariantsFromTemp(input);
   if (timeoutMs <= 0) return work;
-  // 兜底路径无法真正中断原生任务，仅做超时拒绝，行为与旧版 withTimeout 一致。
+  // 即便超时一方先 reject，也要消化 work 的后续 rejection，避免未处理的 Promise 拒绝。
   work.catch(() => {});
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`照片处理超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`)),
-      timeoutMs,
-    );
+    timer = setTimeout(() => {
+      console.warn(
+        '[photoVariantRunner] 主线程内联处理超时；底层 heic-convert/sharp 任务无法中断，' +
+          '仍会在后台继续占用 CPU/内存直至完成。生产环境应启用 worker 以获得真正的中断能力。',
+      );
+      reject(new Error(`照片处理超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`));
+    }, timeoutMs);
   });
   return Promise.race([work, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
