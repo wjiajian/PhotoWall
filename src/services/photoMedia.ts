@@ -38,6 +38,15 @@ function parsePositiveIntEnv(name: string, fallback: number, max?: number): numb
   return max !== undefined ? Math.min(parsed, max) : parsed;
 }
 
+function parseBoolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'false' || normalized === '0' || normalized === 'no') return false;
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes') return true;
+  return fallback;
+}
+
 const fullMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_FULL_MAX_PX', 0);
 const mediumMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_MEDIUM_MAX_PX', 800);
 const tinyMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_TINY_MAX_PX', 50);
@@ -45,6 +54,11 @@ const tinyMaxPx = parsePositiveIntEnv('PHOTO_THUMBNAIL_TINY_MAX_PX', 50);
 const fullQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_FULL_QUALITY', 92, 100);
 const mediumQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_MEDIUM_QUALITY', 80, 100);
 const tinyQuality = parsePositiveIntEnv('PHOTO_THUMBNAIL_TINY_QUALITY', 60, 100);
+
+// mozjpeg 编码质量更高但 CPU 开销约为基线的 3~5 倍。低配（尤其单核）服务器
+// 可将对应变量设为 false，用少量体积换取大幅降低的 CPU 占用，缓解处理期间卡顿。
+const fullUseMozjpeg = parseBoolEnv('PHOTO_THUMBNAIL_FULL_MOZJPEG', true);
+const mediumUseMozjpeg = parseBoolEnv('PHOTO_THUMBNAIL_MEDIUM_MOZJPEG', true);
 
 export type PhotoInput = Buffer | string;
 type OssPutBody = Parameters<OSS['put']>[1];
@@ -220,14 +234,14 @@ export async function buildPhotoVariantBufferFromSharp(
     if (fullMaxPx > 0) {
       pipeline.resize(fullMaxPx, fullMaxPx, { fit: 'inside', withoutEnlargement: true });
     }
-    return await pipeline.jpeg({ quality: fullQuality, mozjpeg: true }).toBuffer();
+    return await pipeline.jpeg({ quality: fullQuality, mozjpeg: fullUseMozjpeg }).toBuffer();
   }
 
   if (kind === 'medium') {
     return await base
       .clone()
       .resize(mediumMaxPx, mediumMaxPx, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: mediumQuality, mozjpeg: true })
+      .jpeg({ quality: mediumQuality, mozjpeg: mediumUseMozjpeg })
       .toBuffer();
   }
 
@@ -236,6 +250,53 @@ export async function buildPhotoVariantBufferFromSharp(
     .resize(tinyMaxPx, tinyMaxPx, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: tinyQuality })
     .toBuffer();
+}
+
+export interface PhotoVariantBundle {
+  width: number;
+  height: number;
+  photoDate: string | null;
+  full: Buffer;
+  medium: Buffer;
+  tiny: Buffer;
+}
+
+export interface BuildPhotoVariantsInput {
+  tempPath: string;
+  extension: string;
+  inputSizeBytes?: number;
+  fallbackIsoDate?: string;
+}
+
+/**
+ * 从磁盘临时文件一次性生成 full/medium/tiny 三种变体及尺寸、拍摄日期。
+ *
+ * 这是 CPU 密集（heic-convert 解码 + sharp 重编码）的核心逻辑，被抽出以便
+ * worker 线程与本地兜底路径复用同一份实现（DRY）。基础 sharp 实例只解码一次，
+ * 三个变体共享解码结果。
+ */
+export async function buildPhotoVariantsFromTemp(
+  input: BuildPhotoVariantsInput,
+): Promise<PhotoVariantBundle> {
+  const variantSource = await preparePhotoVariantSource(
+    input.tempPath,
+    input.extension,
+    input.inputSizeBytes,
+  );
+  const base = createSharpInput(variantSource.input);
+  const full = await buildPhotoVariantBufferFromSharp(base, 'full');
+  const medium = await buildPhotoVariantBufferFromSharp(base, 'medium');
+  const tiny = await buildPhotoVariantBufferFromSharp(base, 'tiny');
+  const photoDate = await extractPhotoDate(input.tempPath, input.fallbackIsoDate);
+
+  return {
+    width: variantSource.width,
+    height: variantSource.height,
+    photoDate,
+    full,
+    medium,
+    tiny,
+  };
 }
 
 function formatDate(input: string | Date | undefined | null): string | null {
