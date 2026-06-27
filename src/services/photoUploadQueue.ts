@@ -3,19 +3,16 @@ import path from 'path';
 import crypto from 'crypto';
 import type OSS from 'ali-oss';
 import {
-  buildPhotoVariantBufferFromSharp,
   buildOriginalObjectKey,
   buildUploadThumbnailObjectKeys,
   createPhotoOssClient,
-  createSharpInput,
   deleteObjectIgnoreNotFound,
-  extractPhotoDate,
   getContentTypeFromExtension,
   getFormatLabelFromExtension,
-  preparePhotoVariantSource,
   putObject,
   type PhotoOssConfig,
 } from './photoMedia.js';
+import { runPhotoVariant } from './photoVariantRunner.js';
 
 interface PhotoMetadataRecord {
   driveItemId?: string;
@@ -173,26 +170,27 @@ function cleanupOldJobs(): void {
   }
 }
 
-function readMetadataRecords(metadataFile: string): PhotoMetadataRecord[] {
-  if (!fs.existsSync(metadataFile)) {
-    return [];
-  }
+// 元数据读写使用异步 IO：避免每处理一张照片就用同步 readFileSync/writeFileSync
+// 整体读写 images-metadata.json，在照片库较大时一次次阻塞事件循环。
+async function readMetadataRecords(metadataFile: string): Promise<PhotoMetadataRecord[]> {
   try {
-    const content = fs.readFileSync(metadataFile, 'utf8');
+    const content = await fs.promises.readFile(metadataFile, 'utf8');
     const parsed = JSON.parse(content);
     return Array.isArray(parsed) ? (parsed as PhotoMetadataRecord[]) : [];
   } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === 'ENOENT') return [];
     console.error('Failed to parse metadata file:', error);
     return [];
   }
 }
 
-function writeMetadataRecords(metadataFile: string, records: PhotoMetadataRecord[]): void {
+async function writeMetadataRecords(metadataFile: string, records: PhotoMetadataRecord[]): Promise<void> {
   const sorted = [...records].sort((a, b) => {
     if (a.date && b.date) return b.date.localeCompare(a.date);
     return a.filename.localeCompare(b.filename, 'zh-CN');
   });
-  fs.writeFileSync(metadataFile, JSON.stringify(sorted, null, 2), 'utf8');
+  await fs.promises.writeFile(metadataFile, JSON.stringify(sorted, null, 2), 'utf8');
 }
 
 function upsertMetadataRecordByFilename(records: PhotoMetadataRecord[], entry: PhotoMetadataRecord): void {
@@ -241,16 +239,16 @@ async function processOneFile(
   client: OSS,
   metadataFile: string,
   ossTimeoutMs: number,
+  processTimeoutMs: number,
 ): Promise<PhotoUploadResultItem> {
   const uploadedKeys = new Set<string>();
 
   try {
     const extension = path.extname(file.filename).toLowerCase();
-    const metadataRecords = readMetadataRecords(metadataFile);
+    const metadataRecords = await readMetadataRecords(metadataFile);
     const existingRecord = metadataRecords.find(record => record.filename === file.filename);
 
     const objectKey = buildOriginalObjectKey(file.filename);
-    const photoDate = await extractPhotoDate(file.tempPath, new Date().toISOString());
 
     const contentType = file.mimetype?.startsWith('image/')
       ? file.mimetype
@@ -260,25 +258,29 @@ async function processOneFile(
     uploadedKeys.add(objectKey);
 
     const thumbnailKeys = buildUploadThumbnailObjectKeys(file.filename);
-    let photoWidth = existingRecord?.width;
-    let photoHeight = existingRecord?.height;
 
-    {
-      const variantSource = await preparePhotoVariantSource(file.tempPath, extension, file.size);
-      photoWidth = variantSource.width || photoWidth;
-      photoHeight = variantSource.height || photoHeight;
-      const base = createSharpInput(variantSource.input);
+    // CPU 密集的解码/缩放/编码在 worker 子线程完成，主线程不被阻塞；
+    // 超时由调度器以 worker.terminate() 真正中断。
+    const variants = await runPhotoVariant(
+      {
+        tempPath: file.tempPath,
+        extension,
+        inputSizeBytes: file.size,
+        fallbackIsoDate: new Date().toISOString(),
+      },
+      processTimeoutMs,
+    );
+    const photoDate = variants.photoDate;
+    const photoWidth = variants.width || existingRecord?.width;
+    const photoHeight = variants.height || existingRecord?.height;
 
-      for (const variant of [
-        { kind: 'full' as const, key: thumbnailKeys.fullKey },
-        { kind: 'medium' as const, key: thumbnailKeys.mediumKey },
-        { kind: 'tiny' as const, key: thumbnailKeys.tinyKey },
-      ]) {
-        const variantBuffer = await buildPhotoVariantBufferFromSharp(base, variant.kind);
-        await putObject(client, variant.key, variantBuffer, 'image/jpeg', ossTimeoutMs);
-        uploadedKeys.add(variant.key);
-        maybeGC();
-      }
+    for (const variant of [
+      { buffer: variants.full, key: thumbnailKeys.fullKey },
+      { buffer: variants.medium, key: thumbnailKeys.mediumKey },
+      { buffer: variants.tiny, key: thumbnailKeys.tinyKey },
+    ]) {
+      await putObject(client, variant.key, variant.buffer, 'image/jpeg', ossTimeoutMs);
+      uploadedKeys.add(variant.key);
     }
     maybeGC();
 
@@ -319,7 +321,7 @@ async function processOneFile(
       isVisible: existingRecord?.isVisible,
       visibilityUpdatedAt: existingRecord?.visibilityUpdatedAt ?? null,
     });
-    writeMetadataRecords(metadataFile, metadataRecords);
+    await writeMetadataRecords(metadataFile, metadataRecords);
 
     return {
       filename: file.filename,
@@ -346,6 +348,13 @@ async function processJob(job: PhotoUploadJob): Promise<void> {
   const parsedFileTimeout = Number.parseInt(process.env.PHOTO_UPLOAD_FILE_TIMEOUT_MS || '300000', 10);
   const fileTimeoutMs = Number.isFinite(parsedFileTimeout) && parsedFileTimeout > 0 ? parsedFileTimeout : 300000;
   const fileTimeoutSec = Math.round(fileTimeoutMs / 1000);
+  // worker 内 CPU 处理的超时（可真正 terminate 中断），取不大于单文件总超时，
+  // 使其先于外层总超时触发，从而实际中断卡死的原生任务。
+  const parsedProcessTimeout = Number.parseInt(process.env.PHOTO_PROCESS_TIMEOUT_MS || '120000', 10);
+  const processTimeoutMs = Math.min(
+    Number.isFinite(parsedProcessTimeout) && parsedProcessTimeout > 0 ? parsedProcessTimeout : 120000,
+    fileTimeoutMs,
+  );
 
   job.status = 'processing';
   job.updatedAt = nowIso();
@@ -356,7 +365,7 @@ async function processJob(job: PhotoUploadJob): Promise<void> {
     job.updatedAt = nowIso();
 
     try {
-      const promise = processOneFile(file, client, job.metadataFile, ossTimeoutMs);
+      const promise = processOneFile(file, client, job.metadataFile, ossTimeoutMs, processTimeoutMs);
       const result = await withTimeout(
         promise,
         fileTimeoutMs,
