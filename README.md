@@ -12,7 +12,9 @@
 - `/api/photos/*`：照片 metadata、上传任务、显隐和删除
 - `/api/settings/*`：站点设置读取和保存
 
-照片文件保存在 OSS，照片列表和显隐状态保存在 `src/data/images-metadata.json`，站点标题和图标配置保存在 `src/data/site-settings.json`。
+照片文件保存在 OSS，照片列表和显隐状态保存在 `src/data/images-metadata.json`，可恢复上传任务保存在 `src/data/photo-upload-jobs.json`，站点标题和图标配置保存在 `src/data/site-settings.json`。
+
+新上传只接受 JPG/JPEG。Express 只读取 JPEG 头部做格式、尺寸和像素校验，然后把原图流式上传到 OSS；medium（800px）和 tiny（50px）由 OSS 持久化图片处理生成。服务器不在上传链路中加载 Sharp、mozjpeg 或图片 worker。
 
 ## 目录说明
 
@@ -22,9 +24,10 @@ PhotoWall/
 │  ├─ components/PhotoWall/     # 照片墙展示组件
 │  ├─ pages/admin/              # 管理后台页面
 │  ├─ routes/                   # Express API 路由
-│  ├─ services/                 # OSS 上传、图片处理、上传队列
-│  └─ data/                     # images-metadata.json 所在目录
+│  ├─ services/                 # OSS 持久化处理、原子元数据存储、上传队列
+│  └─ data/                     # metadata、上传任务和站点设置
 ├─ scripts/
+│  ├─ migrate-oss-medium-tiny-metadata.mjs
 │  └─ rebuild-oss-photowall-metadata.mjs
 ├─ server.ts                    # Express 入口
 ├─ Dockerfile
@@ -57,20 +60,11 @@ OSS_ACCESS_KEY_SECRET=
 OSS_PHOTOWALL_BASE_URL=
 VITE_OSS_PHOTOWALL_BASE_URL=
 
-PHOTO_UPLOAD_MAX_MB=25
+PHOTO_UPLOAD_MAX_MB=20
 PHOTO_UPLOAD_MAX_FILES_PER_BATCH=1
-PHOTO_UPLOAD_MAX_BATCH_MB=25
-PHOTO_PROCESS_SHARP_CONCURRENCY=1
-PHOTO_PROCESS_MAX_PIXELS=30000000
-PHOTO_HEIC_MAX_MB=15
-PHOTO_THUMBNAIL_FULL_MAX_PX=0
-PHOTO_THUMBNAIL_MEDIUM_MAX_PX=800
-PHOTO_THUMBNAIL_TINY_MAX_PX=50
-PHOTO_THUMBNAIL_FULL_QUALITY=92
-PHOTO_THUMBNAIL_MEDIUM_QUALITY=80
-PHOTO_THUMBNAIL_TINY_QUALITY=60
+PHOTO_UPLOAD_MAX_BATCH_MB=20
 VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH=1
-VITE_PHOTO_UPLOAD_BATCH_MB=25
+VITE_PHOTO_UPLOAD_BATCH_MB=20
 ```
 
 说明：
@@ -80,7 +74,8 @@ VITE_PHOTO_UPLOAD_BATCH_MB=25
 - `OSS_PHOTOWALL_BASE_URL` 是服务端返回图片时使用的 OSS 公开访问地址。
 - `VITE_OSS_PHOTOWALL_BASE_URL` 是前端构建时使用的 OSS 公开访问地址，通常和 `OSS_PHOTOWALL_BASE_URL` 相同。
 - `PHOTO_OSS_OPERATION_TIMEOUT_MS` OSS 单次操作的超时时间（毫秒），默认 `60000`（60 秒）。超过此限制的 OSS 网络请求会被中断。
-- `PHOTO_UPLOAD_FILE_TIMEOUT_MS` 单张照片处理的总超时时间（毫秒），默认 `300000`（5 分钟）。超过此限制的照片会被标记为失败，队列继续处理下一张。
+- 单文件硬上限是 `20MB`，每批固定 `1` 张，同时只允许 `1` 个未完成任务。
+- 新 JPEG 还必须满足总像素不超过 `6000 万`、单边不超过 `20000px`。
 - 修改任何 `VITE_` 开头的变量后，需要重新构建前端或重新构建 Docker 镜像。
 
 ## 本地开发
@@ -108,6 +103,8 @@ npm run start
 ```bash
 npm run build
 npm run build:server
+npm test
+npm run lint
 ```
 
 生产方式启动：
@@ -116,18 +113,52 @@ npm run build:server
 npm run serve
 ```
 
+## 测试
+
+Vitest 覆盖 JPEG 格式/体积/像素校验、同名与队列限制、OSS 重试和失败回滚、每个持久化阶段的重启恢复，以及上传/显隐/删除并发修改 metadata：
+
+```bash
+npm test
+```
+
+真实 OSS 验证使用独立测试前缀，脚本会检查 medium/tiny 的尺寸、JPEG 格式、缓存头和公开 URL，并在结束时删除测试对象：
+
+```bash
+PHOTO_TEST_OSS_PREFIX=photowall-test/persistent \
+npm run test:oss
+```
+
+`PHOTO_TEST_OSS_PREFIX` 必须包含 `test`，避免误写生产照片路径。执行前还需要配置常规 OSS 变量和 `OSS_PHOTOWALL_BASE_URL`。
+
+生产压测脚本会先校验 100 张输入 JPEG（默认至少 18MB、45MP），逐张上传并等待任务完成；每张之后检查照片墙/API、可选的 Nginx URL、SSH TCP 和 Docker OOM/内存趋势。默认结束后删除本次测试照片：
+
+```bash
+PHOTO_STRESS_CONFIRM=UPLOAD_100_TEST_PHOTOS \
+PHOTO_STRESS_BASE_URL=https://photowall.example.domain \
+PHOTO_STRESS_INPUT_DIR=/path/to/100-jpegs \
+PHOTO_STRESS_CONTAINER=photowall \
+PHOTO_STRESS_SSH_HOST=server.example.domain \
+PHOTO_STRESS_HEALTH_URLS=https://photowall.example.domain/,https://photowall.example.domain/api/photos/metadata \
+ADMIN_USERNAME=admin \
+ADMIN_PASSWORD='your-password' \
+npm run test:stress
+```
+
+可用 `PHOTO_STRESS_MAX_GROWTH_MB` 调整暖机后首尾内存中位数允许增长值（默认 96MB）；只有明确设置 `PHOTO_STRESS_KEEP_UPLOADS=1` 才会保留测试照片。验收要求是 100 张全部成功、容器未 OOM、内存不呈阶梯增长，照片墙/Nginx/SSH 全程可用。
+
 ## 从 OSS 同步 Metadata
 
 如果 OSS 中已经存在照片，可以用脚本生成 `src/data/images-metadata.json`。
 
-需要 OSS 中的对象满足这些前缀：
+脚本从 `photowall/origin/` 枚举原图，并识别这些缩略图前缀：
 
 ```text
 photowall/origin/
-photowall/thumbnails/full/
 photowall/thumbnails/medium/
 photowall/thumbnails/tiny/
 ```
+
+`photowall/thumbnails/full/` 只用于历史非 JPEG 兼容，不再是新 JPEG 重建 metadata 的前置条件。
 
 示例：
 
@@ -145,7 +176,7 @@ npm install
 npm run rebuild-oss-metadata
 ```
 
-脚本会读取 OSS 对象、解析 EXIF 拍摄时间、读取图片宽高，并生成：
+脚本通过 OSS `image/exif` 和 `image/info` 读取拍摄时间与尺寸，不下载整张图片，也不调用 Sharp，并生成：
 
 ```text
 src/data/images-metadata.json
@@ -179,8 +210,9 @@ docker compose down
 - 读取 `.env`
 - 挂载 `./src/data:/app/src/data`
 - 使用 `/tmp/photowall-uploads` 作为上传临时目录
+- 将容器内存硬限制为 `512MB`，Node old-space 限制为 `256MB`
 
-`src/data` 挂载很重要。后台上传、显隐切换、删除照片都会更新 `images-metadata.json`，站点设置会更新 `site-settings.json`，挂载后容器重建不会丢状态。
+`src/data` 挂载很重要。后台上传、显隐切换、删除照片会更新 `images-metadata.json`，中断恢复依赖 `photo-upload-jobs.json`，站点设置会更新 `site-settings.json`。
 
 ## GitHub Actions 部署
 
@@ -207,7 +239,8 @@ docker-compose.prod.yml
 5. 服务器执行 `docker compose pull`。
 6. 如果服务器上没有 `src/data/site-settings.json`，就生成一份默认站点设置。
 7. 如果服务器上没有 `src/data/images-metadata.json`，就执行一次 OSS metadata 同步。
-8. 执行 `docker compose up -d` 启动服务。
+8. 运行幂等 metadata 迁移，为迁移前文件保留备份；历史 full 对象不会删除。
+9. 迁移成功后执行 `docker compose up -d` 更新服务。
 
 需要在 GitHub 仓库中配置 Secrets：
 
@@ -229,7 +262,7 @@ VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH
 VITE_PHOTO_UPLOAD_BATCH_MB
 ```
 
-其中 `VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH` 默认 `1`，`VITE_PHOTO_UPLOAD_BATCH_MB` 默认 `25`，低配服务器建议保持默认值。
+其中 `VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH` 固定为 `1`，`VITE_PHOTO_UPLOAD_BATCH_MB` 默认 `20`，应与后端保持一致。
 
 服务器部署目录需要提前准备 `.env`：
 
@@ -288,7 +321,7 @@ Action 会自动在服务器上执行：
 docker compose -f docker-compose.prod.yml run --rm photowall npm run rebuild-oss-metadata
 ```
 
-这一步会读取服务器 `.env` 里的 OSS 配置，从 OSS 同步已有照片到 metadata。之后 metadata 文件存在时，Action 会跳过同步，避免每次部署都重新扫描 OSS。
+这一步会读取服务器 `.env` 里的 OSS 配置，从 OSS 同步已有照片到 metadata。随后部署流程总会执行一次幂等迁移；只有迁移成功才会更新容器。
 
 ## Docker 下同步 OSS Metadata
 
@@ -297,6 +330,7 @@ docker compose -f docker-compose.prod.yml run --rm photowall npm run rebuild-oss
 ```bash
 docker compose build
 docker compose run --rm photowall npm run rebuild-oss-metadata
+docker compose run --rm photowall npm run migrate-oss-metadata
 docker compose up -d
 ```
 
@@ -332,7 +366,7 @@ server {
   ssl_certificate /etc/letsencrypt/live/photowall.example.domain/fullchain.pem;
   ssl_certificate_key /etc/letsencrypt/live/photowall.example.domain/privkey.pem;
 
-  client_max_body_size 80m;
+  client_max_body_size 25m;
 
   location / {
     proxy_pass http://photowall_app;
@@ -359,6 +393,9 @@ docker compose exec photowall sh
 
 # 从 OSS 重建 metadata
 docker compose run --rm photowall npm run rebuild-oss-metadata
+
+# 将存量 JPEG 的 src 切换到原图（自动备份 metadata，不删除 full）
+docker compose run --rm photowall npm run migrate-oss-metadata
 ```
 
 ## 常见问题
@@ -389,7 +426,7 @@ OSS_ACCESS_KEY_ID=
 OSS_ACCESS_KEY_SECRET=
 ```
 
-还需要确认 OSS AccessKey 有上传、删除对象的权限。
+还需要确认 OSS AccessKey 有 `photowall/*` 下读取、写入、删除、查询对象和图片持久化处理权限，并确认 Bucket 支持新版基础图片处理。
 
 ### 修改 VITE 配置后没有生效
 
@@ -408,7 +445,7 @@ volumes:
   - ./src/data:/app/src/data
 ```
 
-这个目录同时保存 `images-metadata.json` 和 `site-settings.json`。
+这个目录同时保存 `images-metadata.json`、`photo-upload-jobs.json` 和 `site-settings.json`。
 
 ### Certbot 提示证书文件不存在
 

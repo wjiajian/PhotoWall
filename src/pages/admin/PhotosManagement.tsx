@@ -66,15 +66,19 @@ interface MonthGroup {
 const PHOTO_ASSET_BASE_URL = import.meta.env.VITE_OSS_PHOTOWALL_BASE_URL as string | undefined;
 const UNKNOWN_MONTH_KEY = 'unknown';
 const parsedMaxFilesPerBatch = Number.parseInt(import.meta.env.VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '1', 10);
-const MAX_FILES_PER_UPLOAD_BATCH = Number.isFinite(parsedMaxFilesPerBatch) && parsedMaxFilesPerBatch > 0
+const MAX_FILES_PER_UPLOAD_BATCH = Number.isFinite(parsedMaxFilesPerBatch) && parsedMaxFilesPerBatch === 1
   ? parsedMaxFilesPerBatch
   : 1;
-const RECOMMENDED_SINGLE_FILE_SIZE_MB = 5;
-const parsedUploadBatchLimitMb = Number.parseInt(import.meta.env.VITE_PHOTO_UPLOAD_BATCH_MB || '25', 10);
+const MAX_SINGLE_FILE_SIZE_MB = 20;
+const parsedUploadBatchLimitMb = Number.parseInt(import.meta.env.VITE_PHOTO_UPLOAD_BATCH_MB || '20', 10);
 const UPLOAD_BATCH_LIMIT_MB = Number.isFinite(parsedUploadBatchLimitMb) && parsedUploadBatchLimitMb > 0
-  ? parsedUploadBatchLimitMb
-  : 25;
+  ? Math.min(parsedUploadBatchLimitMb, MAX_SINGLE_FILE_SIZE_MB)
+  : MAX_SINGLE_FILE_SIZE_MB;
 const MAX_BATCH_BYTES = UPLOAD_BATCH_LIMIT_MB * 1024 * 1024;
+
+function isJpegFile(file: File): boolean {
+  return /\.jpe?g$/i.test(file.name);
+}
 
 function getPhotoKey(photo: Pick<Photo, 'filename' | 'driveItemId'>): string {
   if (photo.driveItemId) return `drive:${photo.driveItemId}`;
@@ -237,6 +241,17 @@ export const PhotosManagement: React.FC = () => {
       return;
     }
 
+    const unsupportedFile = selectedFiles.find(file => !isJpegFile(file));
+    if (unsupportedFile) {
+      setError(`${unsupportedFile.name} 不是 JPG/JPEG 图片`);
+      return;
+    }
+    const oversizedFile = selectedFiles.find(file => file.size > MAX_BATCH_BYTES);
+    if (oversizedFile) {
+      setError(`${oversizedFile.name} 超过 ${UPLOAD_BATCH_LIMIT_MB}MB 上传上限`);
+      return;
+    }
+
     setIsUploading(true);
     setError('');
     setSuccess('');
@@ -284,10 +299,6 @@ export const PhotosManagement: React.FC = () => {
         });
         const data = await parseApiResponse(response);
 
-        if (response.status === 413) {
-          setError(`第 ${index + 1} 批上传失败：请求体过大（HTTP 413）。请在 Nginx 中调大 client_max_body_size。`);
-          return;
-        }
         if (!response.ok || !data.success) {
           setError(data.error || `第 ${index + 1} 批上传失败`);
           return;
@@ -331,8 +342,8 @@ export const PhotosManagement: React.FC = () => {
         fileInputRef.current.value = '';
       }
       await loadPhotos(true);
-    } catch {
-      setError('上传照片失败');
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : '上传照片失败');
     } finally {
       setIsUploading(false);
     }
@@ -421,23 +432,32 @@ export const PhotosManagement: React.FC = () => {
       <div className="bg-white rounded-2xl border border-gray-200 p-4 shadow-sm mb-6">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="flex-1">
-            <p className="text-sm text-gray-700 mb-2">上传照片到 OSS（支持批量）</p>
+            <p className="text-sm text-gray-700 mb-2">上传 JPG/JPEG 到 OSS（逐张处理）</p>
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/*,.heic,.heif"
+              accept="image/jpeg,.jpg,.jpeg"
               onChange={event => {
                 const files = event.target.files ? Array.from(event.target.files) : [];
                 setSelectedFiles(files);
+                const unsupportedFile = files.find(file => !isJpegFile(file));
+                const oversizedFile = files.find(file => file.size > MAX_BATCH_BYTES);
+                if (unsupportedFile) {
+                  setError(`${unsupportedFile.name} 不是 JPG/JPEG 图片`);
+                } else if (oversizedFile) {
+                  setError(`${oversizedFile.name} 超过 ${UPLOAD_BATCH_LIMIT_MB}MB 上传上限`);
+                } else {
+                  setError('');
+                }
               }}
               className="block w-full text-sm text-gray-500 file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200"
             />
             <p className="text-xs text-gray-400 mt-2">
-              已选择 {selectedFiles.length} 张，系统会自动分批上传（每批最多 {MAX_FILES_PER_UPLOAD_BATCH} 张，总计最多 {UPLOAD_BATCH_LIMIT_MB}MB）
+              已选择 {selectedFiles.length} 张；系统按每批 {MAX_FILES_PER_UPLOAD_BATCH} 张依次上传，每张上限 {UPLOAD_BATCH_LIMIT_MB}MB。
             </p>
             <p className="text-xs text-gray-400 mt-1">
-              自动分批规则：每批最多 {MAX_FILES_PER_UPLOAD_BATCH} 张、总计最多 {UPLOAD_BATCH_LIMIT_MB}MB；单张图片建议尽量控制在 {RECOMMENDED_SINGLE_FILE_SIZE_MB}MB 内，体验更好。
+              仅接受实际格式为 JPEG、总像素不超过 6000 万且单边不超过 20000px 的图片；同名文件不会覆盖。
             </p>
           </div>
           <div className="flex items-center gap-2">

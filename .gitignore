@@ -6,3 +6,5 @@ node_modules/
 *log
 
 src/data/images-metadata.json
+src/data/photo-upload-jobs.json
+src/data/images-metadata.json.*.bak

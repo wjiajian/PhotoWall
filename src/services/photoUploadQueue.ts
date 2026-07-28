@@ -1,35 +1,26 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import type OSS from 'ali-oss';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import {
+  MEDIUM_IMAGE_PROCESS,
+  TINY_IMAGE_PROCESS,
   buildOriginalObjectKey,
   buildUploadThumbnailObjectKeys,
   createPhotoOssClient,
   deleteObjectIgnoreNotFound,
-  getContentTypeFromExtension,
-  getFormatLabelFromExtension,
-  putObject,
+  ensurePersistentJpegVariant,
+  objectExists,
+  putOriginalJpeg,
+  readOssPhotoDate,
+  type PhotoOssClient,
   type PhotoOssConfig,
 } from './photoMedia.js';
-import { runPhotoVariant } from './photoVariantRunner.js';
-
-interface PhotoMetadataRecord {
-  driveItemId?: string;
-  filename: string;
-  originalSrc?: string;
-  src: string;
-  srcMedium?: string;
-  srcTiny?: string;
-  width?: number;
-  height?: number;
-  size?: number;
-  format?: string;
-  date?: string;
-  videoSrc?: string;
-  isVisible?: boolean;
-  visibilityUpdatedAt?: string | null;
-}
+import {
+  AtomicVersionedJsonStore,
+  PhotoDataFileError,
+  PhotoMetadataStore,
+  type PhotoMetadataRecord,
+} from './photoMetadataStore.js';
 
 export interface PhotoUploadTempFile {
   tempPath: string;
@@ -37,9 +28,17 @@ export interface PhotoUploadTempFile {
   originalName: string;
   mimetype: string;
   size: number;
+  width: number;
+  height: number;
 }
 
 export type PhotoUploadJobStatus = 'queued' | 'processing' | 'completed' | 'failed';
+export type PhotoUploadJobStage =
+  | 'queued'
+  | 'original-uploaded'
+  | 'medium-completed'
+  | 'tiny-completed'
+  | 'metadata-committed';
 
 export interface PhotoUploadResultItem {
   filename: string;
@@ -63,11 +62,12 @@ export interface PhotoUploadJobSnapshot {
   finishedAt: string | null;
 }
 
-interface PhotoUploadJob {
+export interface PersistedPhotoUploadJob {
   jobId: string;
   status: PhotoUploadJobStatus;
-  files: PhotoUploadTempFile[];
-  total: number;
+  stage: PhotoUploadJobStage;
+  file: PhotoUploadTempFile;
+  total: 1;
   processed: number;
   uploaded: PhotoUploadResultItem[];
   failed: PhotoUploadResultItem[];
@@ -76,74 +76,47 @@ interface PhotoUploadJob {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
-  ossConfig: PhotoOssConfig;
-  metadataFile: string;
 }
 
-const jobs = new Map<string, PhotoUploadJob>();
-const queue: string[] = [];
-let isProcessing = false;
+export class PhotoUploadConflictError extends Error {
+  readonly statusCode = 409;
+
+  constructor(message = '同名照片已存在，请改名后重新上传') {
+    super(message);
+    this.name = 'PhotoUploadConflictError';
+  }
+}
+
+export interface PhotoUploadQueueOptions {
+  jobsFile: string;
+  tempDir: string;
+  metadataStore: PhotoMetadataStore;
+  getOssConfig: () => PhotoOssConfig;
+  createClient?: (config: PhotoOssConfig) => PhotoOssClient;
+  now?: () => Date;
+  sleep?: (delayMs: number) => Promise<void>;
+  variantPollIntervalMs?: number;
+  variantPollTimeoutMs?: number;
+}
+
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
+const TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const VALID_STATUSES = new Set<PhotoUploadJobStatus>(['queued', 'processing', 'completed', 'failed']);
+const VALID_STAGES = new Set<PhotoUploadJobStage>([
+  'queued',
+  'original-uploaded',
+  'medium-completed',
+  'tiny-completed',
+  'metadata-committed',
+]);
 
-// Throttle GC hints so we don't hurt throughput/latency under load.
-const GC_MIN_INTERVAL_MS = 10_000; // at most one GC hint every 10s
-let lastGcAt = 0;
-let hasWarnedAboutMissingGc = false;
-
-// Safe GC hint: only calls global.gc when Node was started with --expose-gc.
-// On 2 GB servers this helps V8 reclaim large Buffer allocations between
-// consecutive photo uploads before memory pressure triggers OOM.
-function maybeGC(): void {
-  const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
-
-  if (typeof gc !== 'function') {
-    if (!hasWarnedAboutMissingGc && process.env.NODE_ENV !== 'test') {
-      hasWarnedAboutMissingGc = true;
-      console.warn(
-        '[photoUploadQueue] global.gc is not available; start Node with --expose-gc to enable manual GC hints.',
-      );
-    }
-    return;
-  }
-
-  const now = Date.now();
-  if (now - lastGcAt < GC_MIN_INTERVAL_MS) {
-    return;
-  }
-
-  lastGcAt = now;
-  gc();
-}
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-/**
- * Returns a promise that rejects with an Error after timeoutMs.
- * If the original promise settles first, the timeout is cleared.
- *
- * **Cancellation note:** This wrapper does **not** cancel the underlying work
- * (sharp/heic-convert/OSS I/O) when the timeout fires — it only rejects the
- * raced promise. The original operation may continue consuming CPU/memory
- * until it completes on its own. A worker-based isolation design is planned
- * for a future iteration to provide true abort capability for stuck native
- * tasks.
- */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  if (timeoutMs <= 0) return promise;
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  // Attach a noop catch to the original promise so that if it rejects after
-  // the timeout has already won the race, it does not become an unhandled rejection.
-  promise.catch(() => {});
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
+function defaultSleep(delayMs: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, delayMs);
   });
 }
 
-function snapshot(job: PhotoUploadJob): PhotoUploadJobSnapshot {
+function snapshot(job: PersistedPhotoUploadJob): PhotoUploadJobSnapshot {
   return {
     jobId: job.jobId,
     status: job.status,
@@ -160,308 +133,521 @@ function snapshot(job: PhotoUploadJob): PhotoUploadJobSnapshot {
   };
 }
 
-function cleanupOldJobs(): void {
-  const cutoff = Date.now() - JOB_TTL_MS;
-  for (const [jobId, job] of jobs.entries()) {
-    if (!job.finishedAt) continue;
-    if (new Date(job.finishedAt).getTime() < cutoff) {
-      jobs.delete(jobId);
-    }
-  }
+function isFinished(job: PersistedPhotoUploadJob): boolean {
+  return job.status === 'completed' || job.status === 'failed';
 }
 
-// 元数据读写使用异步 IO：避免每处理一张照片就用同步 readFileSync/writeFileSync
-// 整体读写 images-metadata.json，在照片库较大时一次次阻塞事件循环。
-async function readMetadataRecords(metadataFile: string): Promise<PhotoMetadataRecord[]> {
+function validatePersistedJob(value: unknown): PersistedPhotoUploadJob {
+  const job = value as Partial<PersistedPhotoUploadJob>;
+  const file = job.file as Partial<PhotoUploadTempFile> | undefined;
+  const valid = typeof job.jobId === 'string'
+    && VALID_STATUSES.has(job.status as PhotoUploadJobStatus)
+    && VALID_STAGES.has(job.stage as PhotoUploadJobStage)
+    && job.total === 1
+    && Number.isInteger(job.processed)
+    && Array.isArray(job.uploaded)
+    && Array.isArray(job.failed)
+    && (typeof job.currentFilename === 'string' || job.currentFilename === null)
+    && typeof job.message === 'string'
+    && typeof job.createdAt === 'string'
+    && typeof job.updatedAt === 'string'
+    && (typeof job.finishedAt === 'string' || job.finishedAt === null)
+    && file !== undefined
+    && typeof file.tempPath === 'string'
+    && typeof file.filename === 'string'
+    && typeof file.originalName === 'string'
+    && typeof file.mimetype === 'string'
+    && typeof file.size === 'number'
+    && typeof file.width === 'number'
+    && typeof file.height === 'number';
+
+  if (!valid) {
+    throw new PhotoDataFileError('上传任务文件包含无效记录，上传服务已暂停');
+  }
+  return value as PersistedPhotoUploadJob;
+}
+
+function formatDate(input: string): string {
+  const date = new Date(input);
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${date.getFullYear()}:${pad(date.getMonth() + 1)}:${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function metadataMatchesJob(record: PhotoMetadataRecord, job: PersistedPhotoUploadJob): boolean {
+  const originKey = buildOriginalObjectKey(job.file.filename);
+  const thumbnails = buildUploadThumbnailObjectKeys(job.file.filename);
+  return record.filename === job.file.filename
+    && record.src === `/${originKey}`
+    && record.originalSrc === `/${originKey}`
+    && record.srcMedium === `/${thumbnails.mediumKey}`
+    && record.srcTiny === `/${thumbnails.tinyKey}`;
+}
+
+async function removeFileIgnoreNotFound(filePath: string): Promise<void> {
   try {
-    const content = await fs.promises.readFile(metadataFile, 'utf8');
-    const parsed = JSON.parse(content);
-    return Array.isArray(parsed) ? (parsed as PhotoMetadataRecord[]) : [];
+    await fs.unlink(filePath);
   } catch (error) {
-    const code = (error as { code?: string }).code;
-    if (code === 'ENOENT') return [];
-    console.error('Failed to parse metadata file:', error);
-    return [];
+    if ((error as { code?: string }).code !== 'ENOENT') throw error;
   }
 }
 
-async function writeMetadataRecords(metadataFile: string, records: PhotoMetadataRecord[]): Promise<void> {
-  const sorted = [...records].sort((a, b) => {
-    if (a.date && b.date) return b.date.localeCompare(a.date);
-    return a.filename.localeCompare(b.filename, 'zh-CN');
-  });
-  await fs.promises.writeFile(metadataFile, JSON.stringify(sorted, null, 2), 'utf8');
-}
+export class PhotoUploadQueue {
+  private readonly options: PhotoUploadQueueOptions;
+  private readonly jobStore: AtomicVersionedJsonStore<PersistedPhotoUploadJob>;
+  private readonly jobs = new Map<string, PersistedPhotoUploadJob>();
+  private readonly queue: string[] = [];
+  private readonly createClient: (config: PhotoOssConfig) => PhotoOssClient;
+  private readonly now: () => Date;
+  private readonly sleep: (delayMs: number) => Promise<void>;
+  private initialized = false;
+  private processing = false;
+  private reservation: string | null = null;
+  private unavailableError: PhotoDataFileError | null = null;
 
-function upsertMetadataRecordByFilename(records: PhotoMetadataRecord[], entry: PhotoMetadataRecord): void {
-  const index = records.findIndex(record => record.filename === entry.filename);
-  if (index >= 0) {
-    records[index] = entry;
-    return;
-  }
-  records.push(entry);
-}
-
-function extractObjectKeyFromUrl(urlValue: string | undefined): string | null {
-  if (!urlValue) return null;
-  const trimmed = urlValue.trim();
-  if (!trimmed) return null;
-
-  let pathname = trimmed;
-  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('//')) {
-    try {
-      const url = trimmed.startsWith('//') ? new URL(`https:${trimmed}`) : new URL(trimmed);
-      pathname = url.pathname;
-    } catch {
-      return null;
-    }
-  }
-
-  const normalizedPath = pathname.split('?')[0].split('#')[0].replace(/^\/+/, '');
-  if (!normalizedPath.startsWith('photowall/')) return null;
-  return normalizedPath;
-}
-
-async function removeTempFile(filePath: string): Promise<void> {
-  try {
-    await fs.promises.unlink(filePath);
-  } catch (error) {
-    const code = (error as { code?: string }).code;
-    if (code !== 'ENOENT') {
-      console.error(`Failed to remove temp upload file ${filePath}:`, error);
-    }
-  }
-}
-
-
-async function processOneFile(
-  file: PhotoUploadTempFile,
-  client: OSS,
-  metadataFile: string,
-  ossTimeoutMs: number,
-  processTimeoutMs: number,
-): Promise<PhotoUploadResultItem> {
-  const uploadedKeys = new Set<string>();
-
-  try {
-    const extension = path.extname(file.filename).toLowerCase();
-    const metadataRecords = await readMetadataRecords(metadataFile);
-    const existingRecord = metadataRecords.find(record => record.filename === file.filename);
-
-    const objectKey = buildOriginalObjectKey(file.filename);
-
-    const contentType = file.mimetype?.startsWith('image/')
-      ? file.mimetype
-      : getContentTypeFromExtension(extension);
-
-    await putObject(client, objectKey, fs.createReadStream(file.tempPath), contentType, ossTimeoutMs);
-    uploadedKeys.add(objectKey);
-
-    const thumbnailKeys = buildUploadThumbnailObjectKeys(file.filename);
-
-    // CPU 密集的解码/缩放/编码在 worker 子线程完成，主线程不被阻塞；
-    // 超时由调度器以 worker.terminate() 真正中断。
-    const variants = await runPhotoVariant(
-      {
-        tempPath: file.tempPath,
-        extension,
-        inputSizeBytes: file.size,
-        fallbackIsoDate: new Date().toISOString(),
+  constructor(options: PhotoUploadQueueOptions) {
+    this.options = options;
+    this.jobStore = new AtomicVersionedJsonStore<PersistedPhotoUploadJob>(
+      options.jobsFile,
+      '照片上传任务文件',
+      value => {
+        const job = validatePersistedJob(value);
+        const relativePath = path.relative(
+          path.resolve(options.tempDir),
+          path.resolve(job.file.tempPath),
+        );
+        if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+          throw new PhotoDataFileError('上传任务引用了临时目录外的文件，上传服务已暂停');
+        }
+        return job;
       },
-      processTimeoutMs,
     );
-    const photoDate = variants.photoDate;
-    const photoWidth = variants.width || existingRecord?.width;
-    const photoHeight = variants.height || existingRecord?.height;
-
-    for (const variant of [
-      { buffer: variants.full, key: thumbnailKeys.fullKey },
-      { buffer: variants.medium, key: thumbnailKeys.mediumKey },
-      { buffer: variants.tiny, key: thumbnailKeys.tinyKey },
-    ]) {
-      await putObject(client, variant.key, variant.buffer, 'image/jpeg', ossTimeoutMs);
-      uploadedKeys.add(variant.key);
-    }
-    maybeGC();
-
-    const srcFull = `/${thumbnailKeys.fullKey}`;
-    const srcMedium = `/${thumbnailKeys.mediumKey}`;
-    const srcTiny = `/${thumbnailKeys.tinyKey}`;
-    const keepKeys = new Set<string>([objectKey, thumbnailKeys.fullKey, thumbnailKeys.mediumKey, thumbnailKeys.tinyKey]);
-    const previousKeys = new Set<string>();
-
-    for (const candidate of [
-      existingRecord?.src,
-      existingRecord?.srcMedium,
-      existingRecord?.srcTiny,
-      existingRecord?.originalSrc,
-    ]) {
-      const key = extractObjectKeyFromUrl(candidate);
-      if (key && !keepKeys.has(key)) {
-        previousKeys.add(key);
-      }
-    }
-
-    for (const key of previousKeys) {
-      await deleteObjectIgnoreNotFound(client, key, ossTimeoutMs);
-    }
-
-    upsertMetadataRecordByFilename(metadataRecords, {
-      filename: file.filename,
-      originalSrc: `/${objectKey}`,
-      src: srcFull,
-      srcMedium,
-      srcTiny,
-      width: photoWidth,
-      height: photoHeight,
-      size: file.size,
-      format: getFormatLabelFromExtension(extension),
-      date: photoDate || undefined,
-      videoSrc: existingRecord?.videoSrc,
-      isVisible: existingRecord?.isVisible,
-      visibilityUpdatedAt: existingRecord?.visibilityUpdatedAt ?? null,
-    });
-    await writeMetadataRecords(metadataFile, metadataRecords);
-
-    return {
-      filename: file.filename,
-      size: file.size,
-      src: srcFull,
-    };
-  } catch (error) {
-    for (const key of uploadedKeys) {
-      try {
-        await deleteObjectIgnoreNotFound(client, key, ossTimeoutMs);
-      } catch (cleanupError) {
-        console.error(`Failed to rollback uploaded OSS object ${key}:`, cleanupError);
-      }
-    }
-    throw error;
-  } finally {
-    await removeTempFile(file.tempPath);
+    this.createClient = options.createClient ?? createPhotoOssClient;
+    this.now = options.now ?? (() => new Date());
+    this.sleep = options.sleep ?? defaultSleep;
   }
-}
 
-async function processJob(job: PhotoUploadJob): Promise<void> {
-  const client = createPhotoOssClient(job.ossConfig);
-  const ossTimeoutMs = job.ossConfig.timeoutMs;
-  const parsedFileTimeout = Number.parseInt(process.env.PHOTO_UPLOAD_FILE_TIMEOUT_MS || '300000', 10);
-  const fileTimeoutMs = Number.isFinite(parsedFileTimeout) && parsedFileTimeout > 0 ? parsedFileTimeout : 300000;
-  const fileTimeoutSec = Math.round(fileTimeoutMs / 1000);
-  // worker 内 CPU 处理的超时（可真正 terminate 中断），取不大于单文件总超时，
-  // 使其先于外层总超时触发，从而实际中断卡死的原生任务。
-  const parsedProcessTimeout = Number.parseInt(process.env.PHOTO_PROCESS_TIMEOUT_MS || '120000', 10);
-  const processTimeoutMs = Math.min(
-    Number.isFinite(parsedProcessTimeout) && parsedProcessTimeout > 0 ? parsedProcessTimeout : 120000,
-    fileTimeoutMs,
-  );
+  private nowIso(): string {
+    return this.now().toISOString();
+  }
 
-  job.status = 'processing';
-  job.updatedAt = nowIso();
-  job.message = '正在处理照片';
+  private sortedJobs(): PersistedPhotoUploadJob[] {
+    return Array.from(this.jobs.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
 
-  for (const file of job.files) {
-    job.currentFilename = file.filename;
-    job.updatedAt = nowIso();
+  private async persistJobs(): Promise<void> {
+    try {
+      await this.jobStore.write(this.sortedJobs());
+    } catch (error) {
+      const wrapped = error instanceof PhotoDataFileError
+        ? error
+        : new PhotoDataFileError('写入照片上传任务文件失败，上传服务已暂停', { cause: error });
+      this.unavailableError = wrapped;
+      throw wrapped;
+    }
+  }
+
+  private async persistStage(
+    job: PersistedPhotoUploadJob,
+    stage: PhotoUploadJobStage,
+    message: string,
+  ): Promise<void> {
+    job.stage = stage;
+    job.message = message;
+    job.updatedAt = this.nowIso();
+    await this.persistJobs();
+  }
+
+  private hasUnfinishedJob(): boolean {
+    return Array.from(this.jobs.values()).some(job => !isFinished(job));
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+    this.initialized = true;
 
     try {
-      const promise = processOneFile(file, client, job.metadataFile, ossTimeoutMs, processTimeoutMs);
-      const result = await withTimeout(
-        promise,
-        fileTimeoutMs,
-        `照片处理超时（超过 ${fileTimeoutSec} 秒）`,
-      );
-      job.uploaded.push(result);
+      const persisted = await this.jobStore.read();
+      await this.options.metadataStore.read();
+
+      for (const rawJob of persisted.items) {
+        const job = rawJob;
+        this.jobs.set(job.jobId, job);
+      }
+      if (Array.from(this.jobs.values()).filter(job => !isFinished(job)).length > 1) {
+        throw new PhotoDataFileError('上传任务文件包含多个未完成任务，上传服务已暂停');
+      }
+
+      const cutoff = this.now().getTime() - JOB_TTL_MS;
+      let changed = false;
+      for (const [jobId, job] of this.jobs.entries()) {
+        if (isFinished(job) && job.finishedAt && new Date(job.finishedAt).getTime() < cutoff) {
+          this.jobs.delete(jobId);
+          changed = true;
+          continue;
+        }
+        if (!isFinished(job)) {
+          job.status = 'queued';
+          job.processed = 0;
+          job.currentFilename = null;
+          job.message = '服务重启，等待恢复上传任务';
+          job.updatedAt = this.nowIso();
+          this.queue.push(job.jobId);
+          changed = true;
+        }
+      }
+
+      if (changed) await this.persistJobs();
+      await this.cleanupUnreferencedTempFiles();
+      void this.processQueue();
     } catch (error) {
-      await removeTempFile(file.tempPath);
-      job.failed.push({
-        filename: file.filename,
-        error: error instanceof Error ? error.message : '上传照片失败',
-      });
+      this.unavailableError = error instanceof PhotoDataFileError
+        ? error
+        : new PhotoDataFileError('初始化照片上传任务失败，上传服务已暂停', { cause: error });
+      console.error('[photoUploadQueue]', this.unavailableError.message, error);
+    }
+  }
+
+  async assertAvailable(): Promise<void> {
+    if (!this.initialized) await this.initialize();
+    if (this.unavailableError) throw this.unavailableError;
+
+    try {
+      await Promise.all([
+        this.options.metadataStore.read(),
+        this.jobStore.read(),
+      ]);
+    } catch (error) {
+      this.unavailableError = error instanceof PhotoDataFileError
+        ? error
+        : new PhotoDataFileError('照片数据文件不可用，上传服务已暂停', { cause: error });
+      throw this.unavailableError;
+    }
+  }
+
+  reserveUpload(): string | null {
+    if (!this.initialized || this.unavailableError) {
+      throw this.unavailableError ?? new PhotoDataFileError('照片上传服务尚未初始化');
+    }
+    if (this.reservation || this.hasUnfinishedJob()) return null;
+    this.reservation = crypto.randomUUID();
+    return this.reservation;
+  }
+
+  releaseUploadReservation(reservation: string): void {
+    if (this.reservation === reservation) this.reservation = null;
+  }
+
+  async assertFilenameAvailable(filename: string): Promise<void> {
+    const records = await this.options.metadataStore.read();
+    if (records.some(record => record.filename === filename)) {
+      throw new PhotoUploadConflictError();
+    }
+
+    const config = this.options.getOssConfig();
+    const client = this.createClient(config);
+    const originalKey = buildOriginalObjectKey(filename);
+    const thumbnails = buildUploadThumbnailObjectKeys(filename);
+    const exists = await Promise.all([
+      objectExists(client, originalKey, config.timeoutMs),
+      objectExists(client, thumbnails.mediumKey, config.timeoutMs),
+      objectExists(client, thumbnails.tinyKey, config.timeoutMs),
+    ]);
+    if (exists.some(Boolean)) throw new PhotoUploadConflictError();
+  }
+
+  async enqueue(
+    file: PhotoUploadTempFile,
+    reservation: string,
+  ): Promise<PhotoUploadJobSnapshot> {
+    if (this.reservation !== reservation) {
+      throw new Error('上传名额已失效，请重新提交');
+    }
+
+    const timestamp = this.nowIso();
+    const job: PersistedPhotoUploadJob = {
+      jobId: crypto.randomUUID(),
+      status: 'queued',
+      stage: 'queued',
+      file,
+      total: 1,
+      processed: 0,
+      uploaded: [],
+      failed: [],
+      currentFilename: null,
+      message: '等待上传原图',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      finishedAt: null,
+    };
+
+    this.reservation = null;
+    this.jobs.set(job.jobId, job);
+    try {
+      await this.persistJobs();
+    } catch (error) {
+      this.jobs.delete(job.jobId);
+      throw error;
+    }
+    this.queue.push(job.jobId);
+    void this.processQueue();
+    return snapshot(job);
+  }
+
+  getJob(jobId: string): PhotoUploadJobSnapshot | null {
+    const job = this.jobs.get(jobId);
+    return job ? snapshot(job) : null;
+  }
+
+  isFilenameActive(filename: string): boolean {
+    return Array.from(this.jobs.values()).some(job => !isFinished(job) && job.file.filename === filename);
+  }
+
+  private async processQueue(): Promise<void> {
+    if (this.processing || this.unavailableError) return;
+    this.processing = true;
+
+    try {
+      while (this.queue.length > 0 && !this.unavailableError) {
+        const jobId = this.queue.shift();
+        if (!jobId) continue;
+        const job = this.jobs.get(jobId);
+        if (!job || isFinished(job)) continue;
+        try {
+          await this.processJob(job);
+        } catch (error) {
+          console.error(`[photoUploadQueue] job ${job.jobId} stopped unexpectedly:`, error);
+          if (error instanceof PhotoDataFileError) this.unavailableError = error;
+        }
+      }
     } finally {
-      job.processed += 1;
-      job.updatedAt = nowIso();
-      // Hint V8 to reclaim large buffers before the next file
-      maybeGC();
+      this.processing = false;
     }
   }
 
-  job.currentFilename = null;
-  job.finishedAt = nowIso();
-  job.updatedAt = job.finishedAt;
+  private async processJob(job: PersistedPhotoUploadJob): Promise<void> {
+    const config = this.options.getOssConfig();
+    const missingConfig = [
+      ['OSS_REGION', config.region],
+      ['OSS_BUCKET', config.bucket],
+      ['OSS_ACCESS_KEY_ID', config.accessKeyId],
+      ['OSS_ACCESS_KEY_SECRET', config.accessKeySecret],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missingConfig.length > 0) {
+      this.unavailableError = new PhotoDataFileError(
+        `OSS 配置缺失，无法恢复上传任务: ${missingConfig.join(', ')}`,
+      );
+      return;
+    }
+    const client = this.createClient(config);
 
-  if (job.uploaded.length === 0) {
+    job.status = 'processing';
+    job.currentFilename = job.file.filename;
+    job.message = '正在检查 OSS 处理进度';
+    job.updatedAt = this.nowIso();
+    await this.persistJobs();
+
+    try {
+      const existingMetadata = (await this.options.metadataStore.read())
+        .find(record => record.filename === job.file.filename);
+      if (existingMetadata) {
+        if (!metadataMatchesJob(existingMetadata, job)) {
+          await this.failJob(job, new PhotoUploadConflictError(), client, config.timeoutMs, false);
+          return;
+        }
+        job.stage = 'metadata-committed';
+        await this.completeJob(job);
+        return;
+      }
+
+      const originalKey = buildOriginalObjectKey(job.file.filename);
+      const thumbnails = buildUploadThumbnailObjectKeys(job.file.filename);
+
+      if (!await objectExists(client, originalKey, config.timeoutMs)) {
+        await fs.access(job.file.tempPath);
+        job.message = '正在流式上传 JPEG 原图';
+        job.updatedAt = this.nowIso();
+        await this.persistJobs();
+        await putOriginalJpeg(client, originalKey, job.file.tempPath, config.timeoutMs);
+      }
+      await this.persistStage(job, 'original-uploaded', '原图已上传，正在生成 medium 缩略图');
+
+      await ensurePersistentJpegVariant(
+        client,
+        originalKey,
+        thumbnails.mediumKey,
+        MEDIUM_IMAGE_PROCESS,
+        config.timeoutMs,
+        {
+          attempts: 3,
+          pollIntervalMs: this.options.variantPollIntervalMs,
+          pollTimeoutMs: this.options.variantPollTimeoutMs,
+          sleep: this.sleep,
+        },
+      );
+      await this.persistStage(job, 'medium-completed', 'medium 已完成，正在生成 tiny 缩略图');
+
+      await ensurePersistentJpegVariant(
+        client,
+        originalKey,
+        thumbnails.tinyKey,
+        TINY_IMAGE_PROCESS,
+        config.timeoutMs,
+        {
+          attempts: 3,
+          pollIntervalMs: this.options.variantPollIntervalMs,
+          pollTimeoutMs: this.options.variantPollTimeoutMs,
+          sleep: this.sleep,
+        },
+      );
+      await this.persistStage(job, 'tiny-completed', '缩略图已完成，正在提交照片元数据');
+
+      const photoDate = await readOssPhotoDate(client, originalKey, config.timeoutMs)
+        ?? formatDate(job.createdAt);
+      const entry: PhotoMetadataRecord = {
+        filename: job.file.filename,
+        originalSrc: `/${originalKey}`,
+        src: `/${originalKey}`,
+        srcMedium: `/${thumbnails.mediumKey}`,
+        srcTiny: `/${thumbnails.tinyKey}`,
+        width: job.file.width,
+        height: job.file.height,
+        size: job.file.size,
+        format: 'JPEG',
+        date: photoDate,
+        visibilityUpdatedAt: null,
+      };
+
+      await this.options.metadataStore.update(records => {
+        const existing = records.find(record => record.filename === job.file.filename);
+        if (existing) {
+          if (!metadataMatchesJob(existing, job)) throw new PhotoUploadConflictError();
+          return { records, result: undefined };
+        }
+        return { records: [...records, entry], result: undefined };
+      });
+
+      job.stage = 'metadata-committed';
+      job.message = '照片元数据已提交';
+      job.updatedAt = this.nowIso();
+      await this.persistJobs();
+      await this.completeJob(job);
+    } catch (error) {
+      if (job.stage === 'metadata-committed') {
+        await this.completeJob(job).catch(completionError => {
+          console.error('[photoUploadQueue] failed to finalize committed job:', completionError);
+        });
+        return;
+      }
+      await this.failJob(job, error, client, config.timeoutMs);
+    }
+  }
+
+  private async completeJob(job: PersistedPhotoUploadJob): Promise<void> {
+    const originalKey = buildOriginalObjectKey(job.file.filename);
+    job.status = 'completed';
+    job.processed = 1;
+    job.currentFilename = null;
+    job.uploaded = [{
+      filename: job.file.filename,
+      size: job.file.size,
+      src: `/${originalKey}`,
+    }];
+    job.failed = [];
+    job.message = '原图与 OSS 持久化缩略图均已就绪';
+    job.finishedAt = this.nowIso();
+    job.updatedAt = job.finishedAt;
+    await this.persistJobs();
+    await removeFileIgnoreNotFound(job.file.tempPath);
+  }
+
+  private async cleanupJobObjects(
+    job: PersistedPhotoUploadJob,
+    client: PhotoOssClient,
+    timeoutMs: number,
+  ): Promise<void> {
+    const thumbnails = buildUploadThumbnailObjectKeys(job.file.filename);
+    const keys = [
+      buildOriginalObjectKey(job.file.filename),
+      thumbnails.mediumKey,
+      thumbnails.tinyKey,
+    ];
+
+    for (const key of keys) {
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          await deleteObjectIgnoreNotFound(client, key, timeoutMs);
+          lastError = undefined;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt < 3) await this.sleep(attempt * 250);
+        }
+      }
+      if (lastError) {
+        console.error(`[photoUploadQueue] failed to rollback OSS object ${key}:`, lastError);
+      }
+    }
+  }
+
+  private async failJob(
+    job: PersistedPhotoUploadJob,
+    error: unknown,
+    client: PhotoOssClient,
+    timeoutMs: number,
+    cleanupObjects = true,
+  ): Promise<void> {
+    if (cleanupObjects) await this.cleanupJobObjects(job, client, timeoutMs);
+    const errorMessage = error instanceof Error ? error.message : '上传照片失败';
     job.status = 'failed';
-    job.message = job.failed[0]?.error || '照片上传失败';
-    return;
-  }
+    job.processed = 1;
+    job.currentFilename = null;
+    job.uploaded = [];
+    job.failed = [{ filename: job.file.filename, error: errorMessage }];
+    job.message = errorMessage;
+    job.finishedAt = this.nowIso();
+    job.updatedAt = job.finishedAt;
 
-  job.status = 'completed';
-  job.message = job.failed.length > 0
-    ? `成功上传 ${job.uploaded.length} 张，失败 ${job.failed.length} 张`
-    : `成功上传并处理 ${job.uploaded.length} 张照片`;
-}
-
-async function processQueue(): Promise<void> {
-  if (isProcessing) return;
-  isProcessing = true;
-
-  try {
-    while (queue.length > 0) {
-      const jobId = queue.shift();
-      if (!jobId) continue;
-      const job = jobs.get(jobId);
-      if (!job) continue;
-      await processJob(job);
+    try {
+      await this.persistJobs();
+    } finally {
+      await removeFileIgnoreNotFound(job.file.tempPath).catch(cleanupError => {
+        console.error(`[photoUploadQueue] failed to remove temp file ${job.file.tempPath}:`, cleanupError);
+      });
     }
-  } finally {
-    isProcessing = false;
   }
-}
 
-export function enqueuePhotoUploadJob(input: {
-  files: PhotoUploadTempFile[];
-  ossConfig: PhotoOssConfig;
-  metadataFile: string;
-}): PhotoUploadJobSnapshot {
-  cleanupOldJobs();
-  const timestamp = nowIso();
-  const job: PhotoUploadJob = {
-    jobId: crypto.randomUUID(),
-    status: 'queued',
-    files: input.files,
-    total: input.files.length,
-    processed: 0,
-    uploaded: [],
-    failed: [],
-    currentFilename: null,
-    message: '等待处理',
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    finishedAt: null,
-    ossConfig: input.ossConfig,
-    metadataFile: input.metadataFile,
-  };
+  private async cleanupUnreferencedTempFiles(): Promise<void> {
+    const referenced = new Set(
+      Array.from(this.jobs.values())
+        .filter(job => !isFinished(job))
+        .map(job => path.resolve(job.file.tempPath)),
+    );
+    const cutoff = this.now().getTime() - TEMP_FILE_MAX_AGE_MS;
 
-  jobs.set(job.jobId, job);
-  queue.push(job.jobId);
-  void processQueue();
-  return snapshot(job);
-}
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.options.tempDir);
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') return;
+      throw error;
+    }
 
-export function getPhotoUploadJob(jobId: string): PhotoUploadJobSnapshot | null {
-  const job = jobs.get(jobId);
-  return job ? snapshot(job) : null;
-}
+    for (const entry of entries) {
+      const filePath = path.resolve(this.options.tempDir, entry);
+      if (referenced.has(filePath)) continue;
+      const stat = await fs.stat(filePath);
+      if (stat.isFile() && stat.mtimeMs < cutoff) {
+        await removeFileIgnoreNotFound(filePath);
+      }
+    }
+  }
 
-export function cleanupPhotoUploadTempDir(tempDir: string): void {
-  if (!fs.existsSync(tempDir)) return;
-
-  for (const entry of fs.readdirSync(tempDir)) {
-    const filePath = path.join(tempDir, entry);
-    const stat = fs.statSync(filePath);
-    if (stat.isFile()) {
-      fs.unlinkSync(filePath);
+  async waitForIdle(timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.processing || this.queue.length > 0 || this.hasUnfinishedJob()) {
+      if (Date.now() >= deadline) throw new Error('等待照片上传队列空闲超时');
+      await this.sleep(5);
     }
   }
 }

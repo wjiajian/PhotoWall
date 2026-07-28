@@ -13,6 +13,7 @@ services:
     volumes:
       - ./src/data:/app/src/data
       - photowall_upload_tmp:/tmp/photowall-uploads
+    mem_limit: 512m
     restart: unless-stopped
 
 volumes:

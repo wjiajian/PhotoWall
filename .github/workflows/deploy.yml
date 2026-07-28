@@ -46,8 +46,8 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             VITE_OSS_PHOTOWALL_BASE_URL=${{ vars.VITE_OSS_PHOTOWALL_BASE_URL }}
-            VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH=${{ vars.VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '3' }}
-            VITE_PHOTO_UPLOAD_BATCH_MB=${{ vars.VITE_PHOTO_UPLOAD_BATCH_MB || '30' }}
+            VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH=${{ vars.VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH || '1' }}
+            VITE_PHOTO_UPLOAD_BATCH_MB=${{ vars.VITE_PHOTO_UPLOAD_BATCH_MB || '20' }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -132,6 +132,9 @@ jobs:
           else
             echo "images-metadata.json exists, skip OSS metadata sync."
           fi
+
+          echo "Migrating JPEG metadata to direct original URLs..."
+          docker compose -f docker-compose.prod.yml run --rm --no-deps photowall npm run migrate-oss-metadata
 
           docker compose -f docker-compose.prod.yml up -d --no-build
           sleep 5

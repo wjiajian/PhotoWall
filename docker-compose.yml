@@ -4,8 +4,8 @@ services:
       context: .
       args:
         VITE_OSS_PHOTOWALL_BASE_URL: ${VITE_OSS_PHOTOWALL_BASE_URL:-}
-        VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH: ${VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH:-3}
-        VITE_PHOTO_UPLOAD_BATCH_MB: ${VITE_PHOTO_UPLOAD_BATCH_MB:-30}
+        VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH: ${VITE_PHOTO_UPLOAD_MAX_FILES_PER_BATCH:-1}
+        VITE_PHOTO_UPLOAD_BATCH_MB: ${VITE_PHOTO_UPLOAD_BATCH_MB:-20}
     image: jiajian-photowall:latest
     container_name: photowall
     env_file:
@@ -19,6 +19,7 @@ services:
     volumes:
       - ./src/data:/app/src/data
       - photowall_upload_tmp:/tmp/photowall-uploads
+    mem_limit: 512m
     restart: unless-stopped
 
 volumes:

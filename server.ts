@@ -1,17 +1,16 @@
+import 'dotenv/config';
 import express, { type Express, type Request, type Response } from 'express';
 import cors, { type CorsOptions } from 'cors';
-import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import helmet from 'helmet';
 
 import authRoutes from './src/routes/auth.js';
-import photosRoutes from './src/routes/photos.js';
+import photosRoutes, { initializePhotosService } from './src/routes/photos.js';
 import settingsRoutes from './src/routes/settings.js';
 import { assertAuthConfig } from './src/config/auth.js';
 
-dotenv.config();
 assertAuthConfig();
 
 const app: Express = express();
@@ -89,10 +88,14 @@ app.use((req: Request, res: Response) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-function startServer(): void {
+async function startServer(): Promise<void> {
+  await initializePhotosService();
   app.listen(port, () => {
     console.log(`[server]: PhotoWall is running at http://localhost:${port}`);
   });
 }
 
-startServer();
+void startServer().catch(error => {
+  console.error('[server]: Failed to initialize PhotoWall:', error);
+  process.exitCode = 1;
+});
