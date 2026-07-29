@@ -136,7 +136,7 @@ jobs:
           echo "Migrating JPEG metadata to direct original URLs..."
           docker compose -f docker-compose.prod.yml run --rm --no-deps photowall npm run migrate-oss-metadata
 
-          docker compose -f docker-compose.prod.yml up -d --no-build
+          docker compose -f docker-compose.prod.yml up -d --no-build --force-recreate photowall
           sleep 5
           docker compose -f docker-compose.prod.yml ps photowall
           if [ -z "$(docker compose -f docker-compose.prod.yml ps --status running -q photowall)" ]; then
