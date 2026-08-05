@@ -47,9 +47,8 @@ export const PhotoGrid: React.FC<PhotoGridProps> = ({ images, columns, onImageCl
     <div 
       className="photowall-grid"
       style={{
-        columnCount: columns,
-        columnGap: '6px',
-      }}
+        '--photowall-columns': columns,
+      } as React.CSSProperties}
     >
       {images.map((image, index) => {
         const dims = imageDimensions.get(index);
@@ -61,7 +60,7 @@ export const PhotoGrid: React.FC<PhotoGridProps> = ({ images, columns, onImageCl
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.4, delay: index * 0.03 }}
-            className="photowall-item group relative mb-1.5 break-inside-avoid cursor-pointer overflow-hidden rounded-lg" // 添加 rounded-lg 让外观更干净
+            className="photowall-item group relative cursor-pointer overflow-hidden rounded-lg" // 添加 rounded-lg 让外观更干净
             onClick={() => onImageClick(index)}
             onMouseEnter={() => handleMouseEnter(index)}
             onMouseLeave={() => handleMouseLeave(index)}

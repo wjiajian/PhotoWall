@@ -759,26 +759,26 @@ body {
 
 /* ====== Photo Wall 照片墙样式 ====== */
 .photowall-grid {
-  /* 瀑布流布局优化 */
-  column-fill: balance;
+  display: grid;
+  grid-template-columns: repeat(var(--photowall-columns, 4), minmax(0, 1fr));
+  align-items: start;
+  gap: 6px;
 }
 
 .photowall-item {
-  /* 防止图片被拆分到多列 */
-  break-inside: avoid;
-  page-break-inside: avoid;
+  align-self: start;
 }
 
 /* 响应式列数 */
 @media (max-width: 640px) {
   .photowall-grid {
-    column-count: 2 !important;
+    --photowall-columns: 2 !important;
   }
 }
 
 @media (min-width: 641px) and (max-width: 1023px) {
   .photowall-grid {
-    column-count: 3 !important;
+    --photowall-columns: 3 !important;
   }
 }
 
