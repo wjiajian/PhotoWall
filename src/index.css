@@ -765,21 +765,11 @@ body {
   gap: 6px;
 }
 
-.photowall-item {
-  align-self: start;
-}
-
-/* 响应式列数 */
-@media (max-width: 640px) {
-  .photowall-grid {
-    --photowall-columns: 2 !important;
-  }
-}
-
-@media (min-width: 641px) and (max-width: 1023px) {
-  .photowall-grid {
-    --photowall-columns: 3 !important;
-  }
+.photowall-column {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
 }
 
 /* 图片加载动画 */
